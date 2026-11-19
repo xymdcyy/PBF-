@@ -316,3 +316,20 @@ pbf-uploader/
 ├─ data_2027.xx/           当期上传数据（多期间为 data_首_末/）
 └─ logs/                   审计日志
 ```
+
+---
+
+## 9. 开发与测试
+
+纯逻辑模块（如 `engine/periods.py`、配置校验、webapp 运行状态管理等）不依赖 COM/Office。
+`engine/__init__.py` 采用按需导入（PEP 562），`import engine` 或
+`from engine import periods` 不会加载 pywin32，因此可以在没有 Excel 的环境里测试：
+
+```bat
+python -m unittest discover -s tests -v
+```
+
+同一套测试可直接接入 CI（Windows + Python 3.10 / 3.12），不需要安装 Office 或 pywin32。
+
+审计日志 `logs/YYYYMMDD.jsonl` 默认保留 180 天，可用环境变量
+`PBF_AUDIT_RETENTION_DAYS` 调整；启动任意命令时自动清理过期文件。

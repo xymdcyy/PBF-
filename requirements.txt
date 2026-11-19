@@ -1,9 +1,10 @@
 # PBF 滚动预测自动编制工具 — 运行依赖
 # 安装：pip install -r requirements.txt
-pandas>=2.0
-openpyxl>=3.1
-PyYAML>=6.0
-pywin32>=306
-uiautomation>=2.0.18
-comtypes>=1.2
-flask>=3.0
+# 上限用于避免上游大版本升级带来的破坏性变更（pandas 3 / flask 4 等）。
+pandas>=2.0,<3.0
+openpyxl>=3.1,<4.0
+PyYAML>=6.0,<7.0
+pywin32>=306,<400
+uiautomation>=2.0.18,<3.0
+comtypes>=1.2,<2.0
+flask>=3.0,<4.0

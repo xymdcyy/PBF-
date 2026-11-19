@@ -83,8 +83,29 @@ def load_data(path: Path) -> list[dict]:
     return df.to_dict(orient="records")
 
 
+AUDIT_RETENTION_DAYS = int(os.environ.get("PBF_AUDIT_RETENTION_DAYS", "180"))
+_audit_pruned = False
+
+
+def _prune_audit_logs(log_dir: Path = LOG_DIR,
+                      max_age_days: int = AUDIT_RETENTION_DAYS) -> None:
+    """删除超过保留期的审计日志（每次进程只扫描一次）。"""
+    global _audit_pruned
+    if _audit_pruned:
+        return
+    _audit_pruned = True
+    cutoff = time.time() - max_age_days * 86400
+    for f in log_dir.glob("*.jsonl"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
 def audit_log(action: str, payload: dict) -> None:
     LOG_DIR.mkdir(exist_ok=True)
+    _prune_audit_logs()
     fn = LOG_DIR / f"{datetime.now():%Y%m%d}.jsonl"
     record = {"ts": datetime.now().isoformat(), "action": action, **payload}
     with open(fn, "a", encoding="utf-8") as f:
