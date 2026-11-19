@@ -59,12 +59,34 @@ def _normalize_periods(periods: Any) -> list[str]:
     return out
 
 
-def _dump(out_dir: Path, name: str, rows: list[dict]) -> int:
-    if not rows:
-        return 0
+# 一次导出固定产生的 5 份 CSV（顺序与 _export 一致）
+EXPORT_FILES = (
+    "价格销量CT.csv",
+    "客户费用.csv",
+    "HQ毛上调整.csv",
+    "其他成本.csv",
+    "费用及损益其他项.csv",
+)
+
+
+def _clean_output(out_dir: Path, names=EXPORT_FILES) -> None:
+    """删除输出目录里上一轮的 CSV。
+
+    0 行的表也必须留下只有表头的文件；否则旧文件会残留，被 run-flow 当成
+    本次数据上传（错误数据进 BPC）。单独抽出来也方便测试。
+    """
+    for name in names:
+        try:
+            (out_dir / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _dump(out_dir: Path, name: str, rows: list[dict], fieldnames: list[str]) -> int:
+    """写 CSV（0 行也写表头），返回数据行数。"""
     path = out_dir / name
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
     return len(rows)
@@ -81,6 +103,7 @@ def export_template(xlsx_path: Path, periods: Any, out_dir: Path, zero: bool = F
     if not xlsx_path.exists():
         raise FileNotFoundError(f"模板文件不存在: {xlsx_path}")
     out_dir.mkdir(parents=True, exist_ok=True)
+    _clean_output(out_dir)
 
     def load(data_only: bool):
         return load_workbook(xlsx_path, read_only=True, data_only=data_only)
@@ -96,33 +119,36 @@ def export_template(xlsx_path: Path, periods: Any, out_dir: Path, zero: bool = F
 
 
 def _export(wb, periods: list[str], out_dir: Path, zero: bool) -> dict[str, int]:
+    """导出 5 份 CSV，返回 {文件名: 行数}。0 行的表写只有表头的文件。"""
     result: dict[str, int] = {}
 
-    result["价格销量CT.csv"] = _dump(
-        out_dir, "价格销量CT.csv",
-        _export_measures(wb["价格&销量&加权CT"], periods, zero))
-    result["客户费用.csv"] = _dump(
-        out_dir, "客户费用.csv",
-        _export_wide(wb["客户费用"], header_row=1, dim_cols=[0, 1],
-                     dim_names=["渠道", "科目"], data_start=2, periods=periods, zero=zero))
-    result["HQ毛上调整.csv"] = _dump(
-        out_dir, "HQ毛上调整.csv", _export_hq(wb["HQ毛上调整"], periods, zero))
-    result["其他成本.csv"] = _dump(
-        out_dir, "其他成本.csv",
-        _export_wide(wb["其他成本"], header_row=1, dim_cols=[2],
-                     dim_names=["item"], data_start=2, periods=periods, zero=zero))
-    result["费用及损益其他项.csv"] = _dump(
-        out_dir, "费用及损益其他项.csv",
-        _export_wide(wb["变动费用"], header_row=1, dim_cols=[0, 1, 2, 3, 4, 5],
-                     dim_names=["组织", "科目", "产品", "区域", "渠道", "品牌"],
-                     data_start=2, periods=periods, zero=zero))
+    rows, fields = _export_measures(wb["价格&销量&加权CT"], periods, zero)
+    result["价格销量CT.csv"] = _dump(out_dir, "价格销量CT.csv", rows, fields)
+
+    rows, fields = _export_wide(wb["客户费用"], header_row=1, dim_cols=[0, 1],
+                                dim_names=["渠道", "科目"], data_start=2,
+                                periods=periods, zero=zero)
+    result["客户费用.csv"] = _dump(out_dir, "客户费用.csv", rows, fields)
+
+    rows, fields = _export_hq(wb["HQ毛上调整"], periods, zero)
+    result["HQ毛上调整.csv"] = _dump(out_dir, "HQ毛上调整.csv", rows, fields)
+
+    rows, fields = _export_wide(wb["其他成本"], header_row=1, dim_cols=[2],
+                                dim_names=["item"], data_start=2,
+                                periods=periods, zero=zero)
+    result["其他成本.csv"] = _dump(out_dir, "其他成本.csv", rows, fields)
+
+    rows, fields = _export_wide(wb["变动费用"], header_row=1, dim_cols=[0, 1, 2, 3, 4, 5],
+                                dim_names=["组织", "科目", "产品", "区域", "渠道", "品牌"],
+                                data_start=2, periods=periods, zero=zero)
+    result["费用及损益其他项.csv"] = _dump(out_dir, "费用及损益其他项.csv", rows, fields)
     return result
 
 
 # ---------- 宽表（simple / keyed 布局，期间在列上） ----------
 
 def _export_wide(ws, header_row: int, dim_cols: list[int], dim_names: list[str],
-                 data_start: int, periods: list[str], zero: bool) -> list[dict]:
+                 data_start: int, periods: list[str], zero: bool) -> tuple[list[dict], list[str]]:
     """宽表：维度列在 dim_cols，期间列在 header_row 表头行里动态识别，按维度键求和聚合。"""
     rows = _rows(ws)
     header = rows[header_row]
@@ -165,12 +191,12 @@ def _export_wide(ws, header_row: int, dim_cols: list[int], dim_names: list[str],
                 row[p] = ""                      # 空期间写空串，填表时按空跳过
         if has_any:
             out.append(row)
-    return out
+    return out, [*dim_names, *periods]
 
 
 # ---------- HQ毛上调整（matrix 布局，区域名取自行 2 的 B 列） ----------
 
-def _export_hq(ws, periods: list[str], zero: bool) -> list[dict]:
+def _export_hq(ws, periods: list[str], zero: bool) -> tuple[list[dict], list[str]]:
     rows = _rows(ws)
     header = rows[0]
     per_col: dict[str, int] = {}
@@ -213,12 +239,12 @@ def _export_hq(ws, periods: list[str], zero: bool) -> list[dict]:
                 row[p] = ""
         if has_any:
             out.append(row)
-    return out
+    return out, ["科目", "区域", *periods]
 
 
 # ---------- 价格&销量&加权CT（measure_blocks 布局，期间在行上） ----------
 
-def _export_measures(ws, periods: list[str], zero: bool) -> list[dict]:
+def _export_measures(ws, periods: list[str], zero: bool) -> tuple[list[dict], list[str]]:
     """长表：每个 (产品, 期间) 一行，字段 组织/渠道/品牌/产品/期间 + 3 个度量值。"""
     rows = _rows(ws)
     row0 = rows[0]                 # 度量组名（单价/销量/加权CT 各 6 列）
@@ -258,4 +284,4 @@ def _export_measures(ws, periods: list[str], zero: bool) -> list[dict]:
                 measures = {groups[k]: ("" if v in (None, "") else v) for k, v in enumerate(vals)}
             out.append({"组织": dims[0], "渠道": dims[1], "品牌": dims[2], "产品": dims[3],
                         "期间": p, **measures})
-    return out
+    return out, ["组织", "渠道", "品牌", "产品", "期间", *groups]

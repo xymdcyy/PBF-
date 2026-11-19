@@ -316,3 +316,16 @@ pbf-uploader/
 ├─ data_2027.xx/           当期上传数据（多期间为 data_首_末/）
 └─ logs/                   审计日志
 ```
+
+---
+
+## 9. 开发与测试
+
+纯逻辑测试（不连接 Excel / AO，无需登录）：
+
+```bat
+python -m unittest discover -s tests -v
+```
+
+覆盖期间解析、数据目录选择（不会把 `data_*_clear` 当数据源）、模板导出/批量清除的
+空表与陈旧文件处理。改完代码先跑一遍，再接真机验证。

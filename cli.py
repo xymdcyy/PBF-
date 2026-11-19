@@ -40,6 +40,8 @@ from engine import (ExcelEngine, ExcelError, FormWriter, Navigator, RunPackageRu
 from engine.clear import clear_data
 from engine.periods import parse_periods
 from engine.template_export import export_template
+from data_dirs import (latest_data_dir as find_latest_data_dir,
+                       list_data_dirs as find_data_dirs)
 from paths import app_root
 
 ROOT = app_root()
@@ -316,20 +318,19 @@ def cmd_scan(args) -> None:
 
 
 def latest_data_dir() -> Path:
-    """默认数据目录：取最新的 data_* 目录；没有则报错提示先导出数据。"""
-    candidates = sorted(p for p in ROOT.glob("data_[0-9]*") if p.is_dir())
-    if not candidates:
+    """默认数据目录：按期间取最新（排除 *_clear）；没有则报错提示先导出数据。"""
+    latest = find_latest_data_dir(ROOT)
+    if latest is None:
         raise SystemExit(
             "未找到任何 data_* 数据目录。请先导出上传数据：\n"
             "  python cli.py export --template 滚动预测模板表.xlsx --periods 2027.01-2027.04\n"
             "或改用 --data-dir 指定已有数据目录。")
-    return candidates[-1]
+    return latest
 
 
 def existing_data_dirs() -> list[Path]:
-    """所有已存在的 data_* 数据目录（排除 *_clear 清除目录）。"""
-    return sorted(p for p in ROOT.glob("data_[0-9]*")
-                  if p.is_dir() and not p.name.endswith("_clear"))
+    """所有已存在的上传数据目录（按期间升序，排除 *_clear 清除目录）。"""
+    return find_data_dirs(ROOT)
 
 
 def default_export_dir(periods: list[str]) -> Path:

@@ -28,6 +28,7 @@ import yaml
 from flask import Flask, jsonify, render_template, request
 
 from paths import app_root
+from data_dirs import latest_data_dir as find_latest_data_dir
 from engine.periods import parse_periods
 
 APP_ROOT = app_root()
@@ -78,8 +79,9 @@ def load_business_units() -> dict:
 
 
 def latest_data_dir() -> str:
-    candidates = sorted(p.name for p in APP_ROOT.glob("data_[0-9]*") if p.is_dir())
-    return candidates[-1] if candidates else ""
+    """最新上传数据目录名（按期间排序，排除 *_clear）；没有返回空串。"""
+    latest = find_latest_data_dir(APP_ROOT)
+    return latest.name if latest else ""
 
 
 def suggested_period() -> str:
