@@ -18,6 +18,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 # 确保项目根在 sys.path（兼容 `python webapp/app.py` 与 `python -m webapp.app`）
 ROOT = Path(__file__).resolve().parent.parent
@@ -29,6 +30,7 @@ from flask import Flask, jsonify, render_template, request
 
 from paths import app_root
 from engine.periods import parse_periods
+from webapp.runs import RunRegistry
 
 APP_ROOT = app_root()
 CONFIG_DIR = APP_ROOT / "config"
@@ -40,6 +42,23 @@ LOG_DIR = APP_ROOT / "logs"
 WEB_RUN_DIR = LOG_DIR / "web"
 
 app = Flask(__name__)
+
+
+@app.before_request
+def _reject_cross_site_post():
+    """只绑 127.0.0.1，但浏览器里别的站点仍可跨站 POST；按 Origin 拒绝。
+
+    命令行/脚本调用通常不带 Origin，照常放行。
+    """
+    if request.method != "POST":
+        return None
+    origin = request.headers.get("Origin")
+    if not origin:
+        return None
+    host = urlparse(origin).hostname or ""
+    if host not in ("127.0.0.1", "localhost") and host != request.host.split(":")[0]:
+        return jsonify({"ok": False, "error": "拒绝跨站 POST 请求"}), 403
+    return None
 
 
 # ---------- 配置读取 ----------
@@ -107,20 +126,74 @@ def _parse_period_spec(spec: str) -> list[str]:
 
 # ---------- 子进程运行管理 ----------
 
-# 单机单 Excel 实例，同一时刻只允许一个流程在跑
-RUNS: dict[str, dict] = {}
-RUN_LOCK = threading.Lock()
+# 单机单 Excel 实例，同一时刻只允许一个流程在跑（begin 原子抢占，避免竞态）
+REGISTRY = RunRegistry()
+RUN_TIMEOUT_ENV = "PBF_RUN_TIMEOUT_SEC"
+RUN_TIMEOUT_DEFAULT_SEC = 3600          # 0 或负数表示不限时
 
 
 def _child_env() -> dict:
     env = os.environ.copy()
     # 让 cli.py 的 print 立即落盘，便于网页实时看到日志
     env["PYTHONUNBUFFERED"] = "1"
+    # 子进程 stdout 是管道而不是控制台；固定 UTF-8，避免中文日志在父进程里乱码
+    env["PYTHONIOENCODING"] = "utf-8"
     return env
 
 
-def _spawn(params: dict) -> str:
-    """启动一次后台运行，返回 run_id。"""
+def _run_timeout_sec() -> float | None:
+    """单次子进程运行超时（秒）；PBF_RUN_TIMEOUT_SEC<=0 表示不限时。"""
+    try:
+        value = float(os.environ.get(RUN_TIMEOUT_ENV, RUN_TIMEOUT_DEFAULT_SEC))
+    except ValueError:
+        value = float(RUN_TIMEOUT_DEFAULT_SEC)
+    return value if value > 0 else None
+
+
+def _kill_tree(pid: int) -> None:
+    """终止子进程及其后代（Windows taskkill /T），忽略失败。"""
+    try:
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, text=True, timeout=30)
+    except Exception:
+        pass
+
+
+def _run_step(cmd: list[str], lf, state: dict) -> int:
+    """启动并等待一个 cli.py 子进程；支持取消与超时。"""
+    if state.get("cancelled"):
+        return -1
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=str(APP_ROOT), env=_child_env(),
+            stdout=lf, stderr=subprocess.STDOUT)
+    except Exception as exc:
+        lf.write(f"[Web] 无法启动子进程：{exc}\n")
+        lf.flush()
+        return -1
+    state["proc"] = proc
+    if state.get("cancelled"):
+        _kill_tree(proc.pid)
+    timeout = _run_timeout_sec()
+    try:
+        rc = proc.wait(timeout=timeout)
+        if state.get("cancelled"):
+            lf.write(f"[Web] 已按取消请求终止（退出码 {rc}）。\n")
+            lf.flush()
+        return rc
+    except subprocess.TimeoutExpired:
+        state["timed_out"] = True
+        lf.write(f"[Web] 运行超过 {timeout:g}s 未结束，已终止子进程树。\n")
+        lf.flush()
+        _kill_tree(proc.pid)
+        try:
+            return proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            return -1
+
+
+def _spawn(params: dict) -> str | None:
+    """启动一次后台运行，返回 run_id；已有流程在跑时返回 None。"""
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
     WEB_RUN_DIR.mkdir(parents=True, exist_ok=True)
     log_path = WEB_RUN_DIR / f"{run_id}.log"
@@ -133,49 +206,57 @@ def _spawn(params: dict) -> str:
     version_display = params.get("version_display") or ""
     switch_version = bool(params.get("switch_version"))
 
-    state = {"done": False, "exit_code": None, "log_path": log_path,
+    state = {"run_id": run_id, "done": False, "exit_code": None, "cancelled": False,
+             "timed_out": False, "proc": None, "log_path": log_path,
              "report_path": report_path, "started": time.time()}
-    with RUN_LOCK:
-        RUNS[run_id] = state
+    if not REGISTRY.begin(run_id, state):
+        return None
 
     def worker() -> None:
-        env = _child_env()
         cli = str(APP_ROOT / "cli.py")
-
-        def run_step(cmd: list[str]) -> int:
-            return subprocess.run(
-                cmd, cwd=str(APP_ROOT), env=env,
-                stdout=lf, stderr=subprocess.STDOUT).returncode
-
-        with open(log_path, "w", encoding="utf-8") as lf:
-            lf.write(f"[Web] 运行参数: 期间={period} 模式={mode}"
-                     f" 版本={version_display or '(未指定)'} 切换版本={switch_version}\n")
-            lf.flush()
-            if switch_version and version_key:
-                lf.write(f"[Web] 切换版本 → {version_key}\n")
+        try:
+            with open(log_path, "w", encoding="utf-8") as lf:
+                lf.write(f"[Web] 运行参数: 期间={period} 模式={mode}"
+                         f" 版本={version_display or '(未指定)'} 切换版本={switch_version}\n")
                 lf.flush()
-                rc = run_step([sys.executable, cli, "switch-version", version_key])
-                if rc != 0:
-                    lf.write(f"[Web] 切换版本失败（退出码 {rc}），流程中止。\n")
+                if switch_version and version_key:
+                    lf.write(f"[Web] 切换版本 → {version_key}\n")
                     lf.flush()
-                    state["exit_code"] = rc
-                    state["done"] = True
+                    rc = _run_step([sys.executable, cli, "switch-version", version_key], lf, state)
+                    if rc != 0:
+                        lf.write(f"[Web] 切换版本失败（退出码 {rc}），流程中止。\n")
+                        lf.flush()
+                        state["exit_code"] = rc
+                        return
+                if state.get("cancelled"):
+                    lf.write("[Web] 已取消，流程未继续执行。\n")
+                    lf.flush()
                     return
-            if mode == "clear":
-                lf.write("[Web] 开始执行批量清除（生成全 0 并运行）…\n")
-                lf.flush()
-                cmd = [sys.executable, cli, "clear", "--periods", period,
-                       "--run", "--report-file", str(report_path)]
-            else:
-                lf.write("[Web] 开始执行全流程（run-flow）…\n")
-                lf.flush()
-                cmd = [sys.executable, cli, "run-flow", "--data-dir", str(data_dir)]
-                if version_display:
-                    cmd += ["--version", version_display]
-                cmd += ["--report-file", str(report_path)]
-            rc = run_step(cmd)
-            state["exit_code"] = rc
+                if mode == "clear":
+                    lf.write("[Web] 开始执行批量清除（生成全 0 并运行）…\n")
+                    lf.flush()
+                    cmd = [sys.executable, cli, "clear", "--periods", period,
+                           "--run", "--report-file", str(report_path)]
+                else:
+                    lf.write("[Web] 开始执行全流程（run-flow）…\n")
+                    lf.flush()
+                    cmd = [sys.executable, cli, "run-flow", "--data-dir", str(data_dir)]
+                    if version_display:
+                        cmd += ["--version", version_display]
+                    cmd += ["--report-file", str(report_path)]
+                state["exit_code"] = _run_step(cmd, lf, state)
+        except Exception as exc:
+            if state["exit_code"] is None:
+                state["exit_code"] = -1
+            try:
+                with open(log_path, "a", encoding="utf-8") as lf:
+                    lf.write(f"[Web] 运行线程异常：{exc}\n")
+            except OSError:
+                pass
+        finally:
+            state["proc"] = None
             state["done"] = True
+            REGISTRY.end(run_id)
 
     threading.Thread(target=worker, daemon=True).start()
     return run_id
@@ -329,9 +410,6 @@ def api_upload():
 
 @app.route("/api/run", methods=["POST"])
 def api_run():
-    with RUN_LOCK:
-        if any(not s["done"] for s in RUNS.values()):
-            return jsonify({"ok": False, "error": "已有一个流程在运行，请等待其结束"}), 409
     data = request.get_json(force=True) or {}
     period = str(data.get("period", "")).strip()
     try:
@@ -349,14 +427,13 @@ def api_run():
         "version_display": data.get("version_display") or "",
         "switch_version": bool(data.get("switch_version")),
     })
+    if run_id is None:
+        return jsonify({"ok": False, "error": "已有一个流程在运行，请等待其结束"}), 409
     return jsonify({"ok": True, "run_id": run_id})
 
 
 @app.route("/api/clear", methods=["POST"])
 def api_clear():
-    with RUN_LOCK:
-        if any(not s["done"] for s in RUNS.values()):
-            return jsonify({"ok": False, "error": "已有一个流程在运行，请等待其结束"}), 409
     data = request.get_json(force=True) or {}
     period = str(data.get("period", "")).strip()
     try:
@@ -370,12 +447,14 @@ def api_clear():
         "version_display": data.get("version_display") or "",
         "switch_version": bool(data.get("switch_version")),
     })
+    if run_id is None:
+        return jsonify({"ok": False, "error": "已有一个流程在运行，请等待其结束"}), 409
     return jsonify({"ok": True, "run_id": run_id, "periods": periods})
 
 
 @app.route("/api/run/<run_id>/log")
 def api_run_log(run_id: str):
-    state = RUNS.get(run_id)
+    state = REGISTRY.get(run_id)
     if state is None:
         return jsonify({"ok": False, "error": "未知 run_id"}), 404
     offset = int(request.args.get("offset", 0))
@@ -388,13 +467,15 @@ def api_run_log(run_id: str):
     exit_code = state["exit_code"] if state["done"] else None
     return jsonify({
         "ok": True, "done": state["done"], "exit_code": exit_code,
+        "cancelled": bool(state.get("cancelled")),
+        "timed_out": bool(state.get("timed_out")),
         "lines": new, "next_offset": len(content),
     })
 
 
 @app.route("/api/run/<run_id>/result")
 def api_run_result(run_id: str):
-    state = RUNS.get(run_id)
+    state = REGISTRY.get(run_id)
     if state is None:
         return jsonify({"ok": False, "error": "未知 run_id"}), 404
     if not state["done"]:
@@ -405,18 +486,26 @@ def api_run_result(run_id: str):
             report = json.loads(state["report_path"].read_text(encoding="utf-8"))
         except Exception:
             report = {}
-    return jsonify({"ok": True, "exit_code": state["exit_code"], "report": report})
+    return jsonify({"ok": True, "exit_code": state["exit_code"], "report": report,
+                    "cancelled": bool(state.get("cancelled")),
+                    "timed_out": bool(state.get("timed_out"))})
 
 
 @app.route("/api/run/<run_id>/cancel", methods=["POST"])
 def api_run_cancel(run_id: str):
-    state = RUNS.get(run_id)
-    if state is None or state["done"]:
-        return jsonify({"ok": False, "error": "无正在运行的流程"}), 400
-    # 子进程由 worker 线程内的 subprocess.run 持有，这里只能标记取消；
-    # 真正终止 Excel 由 run-flow 自身的恢复机制兜底。记录取消意图。
-    state["cancel_requested"] = True
-    return jsonify({"ok": True, "note": "已请求取消（若已进入 Excel 操作，请等待当前步骤结束或手动关闭 Excel）"})
+    state = REGISTRY.get(run_id)
+    if state is None:
+        return jsonify({"ok": False, "error": "未知 run_id"}), 404
+    if state["done"]:
+        return jsonify({"ok": False, "error": "流程已结束，无法取消"}), 400
+    state["cancelled"] = True
+    proc = state.get("proc")
+    if proc is not None and proc.poll() is None:
+        _kill_tree(proc.pid)
+        note = "已终止子进程（Excel 若正在执行宏，会在当前调用返回后停下）"
+    else:
+        note = "已标记取消；当前步骤尚未启动子进程"
+    return jsonify({"ok": True, "note": note})
 
 
 @app.route("/api/env")
@@ -424,8 +513,27 @@ def api_env():
     return jsonify(check_env())
 
 
+def cleanup_web_dir(max_age_days: int = 30) -> int:
+    """删除 logs/web 下过期的日志/结果/上传临时文件，返回删除数量。"""
+    if not WEB_RUN_DIR.exists():
+        return 0
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    for p in WEB_RUN_DIR.iterdir():
+        try:
+            if p.is_file() and p.stat().st_mtime < cutoff:
+                p.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def main() -> None:
     port = int(os.environ.get("PBF_WEB_PORT", "8765"))
+    removed = cleanup_web_dir()
+    if removed:
+        print(f"已清理 {removed} 个过期网页运行日志")
     print(f"PBF Web 界面已启动: http://127.0.0.1:{port}")
     print("仅本机可访问（127.0.0.1）。按 Ctrl+C 退出。")
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)

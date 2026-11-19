@@ -1,0 +1,56 @@
+"""运行注册表：同一时刻只允许一个流程，并保留最近若干次运行状态。
+
+独立于 Flask / engine，方便单元测试；线程安全。
+"""
+from __future__ import annotations
+
+import threading
+
+MAX_KEPT_RUNS = 20
+
+
+class RunRegistry:
+    """进程内运行状态表。
+
+    begin() 原子地抢占「当前运行」槽位；end() 释放。只有持有槽位的运行才能
+    被注册，从而避免两个请求同时通过「是否在运行」检查后再各自启动子进程。
+    """
+
+    def __init__(self, max_kept: int = MAX_KEPT_RUNS):
+        self._runs: dict[str, dict] = {}
+        self._lock = threading.RLock()
+        self._current: str | None = None
+        self._max_kept = max_kept
+
+    def begin(self, run_id: str, state: dict) -> bool:
+        """注册一次运行；已有运行在进行中时返回 False（不注册）。"""
+        with self._lock:
+            if self._current is not None:
+                return False
+            self._current = run_id
+            self._runs[run_id] = state
+            self._prune_locked()
+            return True
+
+    def end(self, run_id: str) -> None:
+        with self._lock:
+            if self._current == run_id:
+                self._current = None
+
+    def get(self, run_id: str) -> dict | None:
+        with self._lock:
+            return self._runs.get(run_id)
+
+    @property
+    def current(self) -> str | None:
+        with self._lock:
+            return self._current
+
+    def _prune_locked(self) -> None:
+        """只淘汰已结束的最旧运行，保持内存与日志引用不无限增长。"""
+        if len(self._runs) <= self._max_kept:
+            return
+        finished = [rid for rid, s in self._runs.items()
+                    if s.get("done") and rid != self._current]
+        for rid in finished[:len(self._runs) - self._max_kept]:
+            self._runs.pop(rid, None)
