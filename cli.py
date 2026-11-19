@@ -19,6 +19,8 @@ Usage:
   python cli.py run-flow --skip-fill      # 跳过填表，只跑计算/运行包/核对
   python cli.py run-flow --only-verify    # 只确认版本 + 读损益指标
   python cli.py run-flow --from-step 4    # 从第 4 步（其他成本）开始，前面 3 步跳过
+  python cli.py run-flow --unit 乐华·电视 # 指定业务单元（品牌×品类），覆盖导航行
+  python cli.py units                      # 列出/校验品牌×品类配置
 """
 from __future__ import annotations
 
@@ -37,6 +39,8 @@ import yaml
 
 from engine import (ExcelEngine, ExcelError, FormWriter, Navigator, RunPackageRunner,
                     FormReader, FormScanner, ensure_excel_ready, run_flow)
+from engine.business_units import (UnitError, apply_unit, check_units,
+                                   csv_dimension_warnings, enabled_unit_names)
 from engine.clear import clear_data
 from engine.periods import parse_periods
 from engine.template_export import export_template
@@ -69,6 +73,11 @@ def load_form_config(form_id: str) -> dict:
 
 def load_dimensions() -> dict:
     return load_yaml(ROOT / "config" / "dimensions.yaml")
+
+
+def load_units_config() -> dict:
+    path = ROOT / "config" / "business_units.yaml"
+    return load_yaml(path) if path.exists() else {}
 
 
 def load_data(path: Path) -> list[dict]:
@@ -360,6 +369,8 @@ def cmd_export(args) -> None:
     print("\n[导出结果]")
     for name, n in rows.items():
         print(f"  {name}: {n} 行")
+    for warning in csv_dimension_warnings(out_dir):
+        print(f"[数据告警] {warning}")
     if args.zero:
         print("\n（zero 模式：所有数值已填 0）")
     audit_log("export", {"template": str(template), "periods": periods,
@@ -389,18 +400,62 @@ def cmd_clear(args) -> None:
         rf_args = SimpleNamespace(
             data_dir=str(out_dir), skip_fill=False, only_verify=False,
             from_step=None, version=None, preflight_only=False,
-            version_key=None, report_file=getattr(args, "report_file", None))
+            version_key=None, unit=getattr(args, "unit", None),
+            report_file=getattr(args, "report_file", None))
         cmd_run_flow(rf_args)
+
+
+def cmd_units(args) -> None:
+    """列出并校验业务单元（品牌×品类）配置。"""
+    units_cfg = load_units_config()
+    flow_cfg = load_yaml(ROOT / "config" / "flow.yaml")
+    if not units_cfg.get("units"):
+        print("未配置业务单元：config/business_units.yaml")
+        return
+    print(f"\n品牌: {', '.join(units_cfg.get('品牌') or []) or '(空)'}")
+    print(f"品类: {', '.join(units_cfg.get('品类') or []) or '(空)'}")
+    print("\n业务单元:")
+    for name, unit in units_cfg["units"].items():
+        unit = unit or {}
+        mark = "✓ 启用" if unit.get("启用") else "  未配置"
+        print(f"  {mark}  {name}  （{unit.get('品牌', '')}·{unit.get('品类', '')}）")
+    issues = check_units(units_cfg, flow_cfg)
+    print(f"\n校验: {'通过' if not issues else f'{len(issues)} 项问题'}")
+    for issue in issues:
+        print(f"  {issue}")
 
 
 def cmd_run_flow(args) -> None:
     """按业务顺序跑完整 PBF 滚动预测流程。"""
-    flow_cfg = load_yaml(ROOT / "config" / "flow.yaml")
+    base_flow = load_yaml(ROOT / "config" / "flow.yaml")
+    units_cfg = load_units_config()
+    unit_name = (getattr(args, "unit", None) or "").strip()
+    if unit_name:
+        try:
+            flow_cfg = apply_unit(base_flow, units_cfg, unit_name)
+        except UnitError as exc:
+            raise SystemExit(f"业务单元配置错误: {exc}")
+        unit = flow_cfg["_unit"]
+        print(f"业务单元: {unit_name}（{unit['brand']}·{unit['category']}）")
+    else:
+        flow_cfg = base_flow
+        available = enabled_unit_names(units_cfg)
+        if available:
+            print(f"业务单元: 未指定 --unit，沿用 flow.yaml 的默认导航行"
+                  f"（可选：{', '.join(available)}）")
+    if units_cfg.get("units"):
+        for issue in check_units(units_cfg, base_flow):
+            if issue.startswith("错误:") and unit_name:
+                raise SystemExit(f"业务单元配置错误: {issue}")
+            print(f"[业务单元] {issue}")
+
     form_cfgs = {s["form"]: load_form_config(s["form"]) for s in flow_cfg["steps"]}
     data_dir = Path(args.data_dir) if args.data_dir else latest_data_dir()
 
     print(f"\n=== run-flow ===")
     print(f"数据目录: {data_dir}")
+    for warning in csv_dimension_warnings(data_dir):
+        print(f"[数据告警] {warning}")
     targets = [f"{y}.{m}" for y, m in re.findall(r"(\d{4})\.(\d{2})", data_dir.name)]
     if targets:
         print(f"目标期间: {max(targets)}")
@@ -417,6 +472,8 @@ def cmd_run_flow(args) -> None:
                       expected_version=args.version, from_step=args.from_step,
                       preflight_only=preflight_only,
                       switch_version_key=getattr(args, "version_key", None))
+    if unit_name:
+        report["unit"] = unit_name
 
     if report.get("login"):
         print("\n[AO 登录] 已就绪")
@@ -559,6 +616,8 @@ def build_parser() -> argparse.ArgumentParser:
     rf.add_argument("--preflight-only", action="store_true",
                     help="干跑：只打开各表单做行匹配/期间覆盖预检，不写入任何数据")
     rf.add_argument("--report-file", help="把最终 report 写成 JSON 到指定路径（供 Web 界面读取）")
+    rf.add_argument("--unit",
+                    help="业务单元（品牌×品类），如 乐华·电视；覆盖 flow.yaml 的 nav_cell")
 
     ex = sub.add_parser("export", help="从滚动预测模板表导出 1–6 个期间的上传数据")
     ex.add_argument("--template", required=True, help="滚动预测模板表 .xlsx 路径")
@@ -572,7 +631,10 @@ def build_parser() -> argparse.ArgumentParser:
     cl.add_argument("--data-dirs", nargs="*", help="数据来源目录，默认全部既有 data_*")
     cl.add_argument("--out-dir", help="输出目录，默认 data_<首>_<末>_clear")
     cl.add_argument("--run", action="store_true", help="生成后接着运行 run-flow 填 0")
+    cl.add_argument("--unit", help="业务单元（品牌×品类），配合 --run 使用")
     cl.add_argument("--report-file", help="run-flow 结果 JSON 路径（配合 --run）")
+
+    un = sub.add_parser("units", help="列出并校验业务单元（品牌×品类）配置")
 
     return p
 
@@ -595,6 +657,7 @@ def main() -> None:
          "scan": cmd_scan,
          "export": cmd_export,
          "clear": cmd_clear,
+         "units": cmd_units,
          "run-flow": cmd_run_flow}[args.cmd](args)
     except ExcelError as exc:
         print(f"\n[ExcelError] {exc}", file=sys.stderr)
