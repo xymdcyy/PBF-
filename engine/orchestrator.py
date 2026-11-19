@@ -23,6 +23,7 @@ import yaml
 
 from .excel import ExcelEngine, ExcelError, is_disconnect
 from .bootstrap import ensure_excel_ready
+from .header_periods import normalize_period_header
 from .navigator import Navigator
 from .writer import FormWriter
 from paths import app_root
@@ -157,6 +158,24 @@ class PbfFlow:
             raise
         log.info("已刷新流程")
 
+    def refresh_flow_retry(self, attempts: int = 3, delay: float = 5.0) -> None:
+        """刷新流程，带重试。
+
+        AO 刚登录/刚打开导航表时，Refresh_Status 常因服务端会话尚未就绪而失败；
+        这是可恢复的瞬时状态，不该直接把整轮流程判死。
+        """
+        last: Optional[BaseException] = None
+        for i in range(1, attempts + 1):
+            try:
+                self.refresh_flow()
+                return
+            except ExcelError as exc:
+                last = exc
+                if i < attempts:
+                    log.warning(f"刷新流程失败（第 {i}/{attempts} 次），{delay:.0f}s 后重试：{exc}")
+                    time.sleep(delay)
+        raise last  # type: ignore[misc]
+
     def recover(self) -> bool:
         """Excel 断开后自动恢复：重开导航表 → 重新登录 → 换上新的引擎。
 
@@ -165,14 +184,14 @@ class PbfFlow:
         rcfg = self.cfg.get("recovery") or {}
         log.warning("Excel 连接已断开，开始自动恢复…")
         try:
-            ensure_excel_ready(self.cfg, kill_stale=bool(rcfg.get("kill_stale_excel", True)))
-            self.engine = ExcelEngine(timeout_sec=20)
+            self.engine = ensure_excel_ready(
+                self.cfg, kill_stale=bool(rcfg.get("kill_stale_excel", True)))
         except Exception as exc:
             log.error(f"自动恢复失败：{exc}")
             return False
 
         login_cfg = login_config(self.cfg)
-        if login_cfg.get("username"):
+        if login_cfg.get("username") and not getattr(self.engine, "login_done", False):
             from .ao_login import AoLogin
 
             ok = AoLogin(
@@ -180,10 +199,13 @@ class PbfFlow:
                 password=login_cfg.get("password", ""),
                 client=str(login_cfg.get("client", "333")),
                 lang=str(login_cfg.get("lang", "zh")),
-            ).ensure(float(login_cfg.get("timeout", 120)))
+            ).ensure(float(login_cfg.get("timeout", 120)),
+                     expect_login=bool(getattr(self.engine, "launched_now", False)))
             if not ok:
                 log.error("恢复后自动登录失败")
                 return False
+        elif getattr(self.engine, "login_done", False):
+            log.info("启动阶段已处理 AO 登录，恢复流程跳过重复登录")
         # AO 刚登录完导航表还在加载，等它可读再交还给调用方
         try:
             self.engine._retry(self._nav_wb, attempts=10, delay=2)
@@ -192,7 +214,7 @@ class PbfFlow:
             log.warning(f"恢复后导航表暂不可读（继续尝试）: {exc}")
         # 重新登录后导航表会回到"全流程视图"（80+ 行），必须刷新状态才能恢复成配置里的 19 行
         try:
-            self.refresh_flow()
+            self.refresh_flow_retry(attempts=3, delay=5)
         except Exception as exc:
             log.warning(f"恢复后刷新流程失败（继续尝试）: {exc}")
         log.info("自动恢复完成，可以继续执行")
@@ -421,13 +443,22 @@ class PbfFlow:
         log.info("已触发执行，等待完成…")
 
         status, duration = "", ""
+        pattern = self.pkg_cfg["workbook_pattern"]
+        sheet_name = self.pkg_cfg["sheet"]
         deadline = time.time() + self.pkg_cfg["max_wait_sec"]
         while time.time() < deadline:
             time.sleep(self.pkg_cfg["poll_interval_sec"])
             try:
+                # Refresh_Sheet 会重算/重建 AO 对象，旧的 wb/ws 可能失效；
+                # 每次刷新前后都按名字重新绑定，避免读到断开的 COM 引用。
+                wb = self.engine.get_workbook(pattern, wait_sec=15)
+                ws = self.engine.open_sheet(wb, sheet_name)
                 self.engine.run_macro(self.pkg_cfg["refresh_macro"], wb)
+                wb = self.engine.get_workbook(pattern, wait_sec=15)
+                ws = self.engine.open_sheet(wb, sheet_name)
             except ExcelError as exc:
                 log.warning(f"刷新状态失败（继续轮询）: {exc}")
+                continue
             time.sleep(2)
             status = str(self._read(ws, self.pkg_cfg["status_cell"]) or "")
             duration = str(self._read(ws, self.pkg_cfg["duration_cell"]) or "")
@@ -455,6 +486,12 @@ class PbfFlow:
             time.sleep(2)
             self.engine.refresh(wb, macro_hint="Refresh_Sheet")
             time.sleep(12)                 # 等 AO 重算期间列（2026 全年 → 2027.01~04）
+            # Refresh_Sheet 可能重建 AO 对象；重新按名字绑定工作簿/Sheet 再读表头
+            try:
+                wb = self.engine.get_workbook("YC_CBG损益查询表*", wait_sec=30)
+                ws = self.engine.open_sheet(wb, vcfg["sheet"])
+            except ExcelError as exc:
+                log.warning(f"刷新后重新绑定损益表失败（沿用原引用）: {exc}")
 
         # 按表头动态解析期间列；若目标期间被前置年度列挤占，先折叠上一年度再读
         header_row = int(vcfg.get("header_row", 54))
@@ -589,6 +626,7 @@ class PbfFlow:
         """读取表头行，返回 {期间文本: 列字母}。扫描范围要足够宽（2027 列可能被 2026 挤到很右侧）。"""
         from .scanner import col_letter
         found: dict[str, str] = {}
+        prev: Optional[tuple[int, int]] = None
         for i in range(col_from, col_to + 1):
             letter = col_letter(i)
             try:
@@ -597,7 +635,10 @@ class PbfFlow:
                 continue
             if v is None:
                 continue
-            key = str(v).strip()
+            # AO 表头可能是文本 / 数字 / 日期，统一归一化后再匹配
+            key, new_prev = normalize_period_header(v, prev)
+            if new_prev != prev:
+                prev = new_prev
             if key and key not in found:
                 found[key] = letter
         return found
@@ -634,16 +675,21 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
             start_idx = idx
         report["from_step"] = steps[start_idx]["form"]
 
-    # 0. 登录（检测到登录框则自动填写；已登录则跳过）
+    # 0. 登录（检测到登录框则自动填写；启动阶段已处理过则跳过）
     login_cfg = login_config(flow_cfg)
-    if login_cfg.get("username"):
+    if getattr(engine, "login_done", False):
+        log.info("启动阶段已处理 AO 登录，跳过重复登录")
+        report["login"] = True
+    elif login_cfg.get("username"):
         from .ao_login import AoLogin
         ok = AoLogin(
             username=login_cfg["username"],
             password=login_cfg.get("password", ""),
             client=str(login_cfg.get("client", "333")),
             lang=str(login_cfg.get("lang", "zh")),
-        ).ensure(float(login_cfg.get("timeout", 60)))
+        ).ensure(float(login_cfg.get("timeout", 60)),
+                 # 刚由本工具启动 Excel 时，登录框还没弹出来，必须等它出现
+                 expect_login=bool(getattr(engine, "launched_now", False)))
         if not ok:
             raise ExcelError("AO 自动登录失败，请手动登录后重试")
         report["login"] = True
@@ -686,7 +732,8 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
     report["version"] = run_with_recovery(
         lambda: flow.confirm_version(expected), "版本确认")
     flow.check_version_window(report["version"])
-    run_with_recovery(flow.refresh_flow, "刷新流程")
+    # AO 刚登录时 Refresh_Status 偶发瞬时失败，内部重试；仍失败才交给恢复机制
+    run_with_recovery(flow.refresh_flow_retry, "刷新流程")
 
     if preflight_only:
         # 干跑：逐张表打开→匹配行→检查期间覆盖→关闭，全程不写入。

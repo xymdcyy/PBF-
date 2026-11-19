@@ -45,12 +45,15 @@ def kill_excel() -> None:
     time.sleep(3)
 
 
-def _start_ao_login(flow_cfg: dict):
+def _start_ao_login(flow_cfg: dict, expect_login: bool = True,
+                    quiet: bool = False, timeout: float | None = None):
     """后台线程自动登录 AO（返回线程对象，未配置账号时返回 None）。
 
     AO 连接 BPC 时弹出的登录框是模态的，会阻塞 Excel 的 COM 消息泵，导致主线程的
     Workbooks 枚举卡住。这里用 uiautomation 在后台线程填登录框（不依赖 Excel COM），
     登录完成后模态框消失，主线程自然恢复。
+
+    quiet=True 用于「守候登录框」场景：等不到登录框属于正常情况，不告警。
     """
     try:
         from .orchestrator import login_config
@@ -60,6 +63,7 @@ def _start_ao_login(flow_cfg: dict):
     login_cfg = login_config(flow_cfg)
     if not login_cfg.get("username"):
         return None
+    wait = float(timeout if timeout is not None else login_cfg.get("timeout", 120))
 
     def _login() -> None:
         # uiautomation 需要在线程内初始化 COM（CoInitialize + 建 UIAutomation 对象），
@@ -72,15 +76,27 @@ def _start_ao_login(flow_cfg: dict):
                     password=login_cfg.get("password", ""),
                     client=str(login_cfg.get("client", "333")),
                     lang=str(login_cfg.get("lang", "zh")),
-                ).ensure(float(login_cfg.get("timeout", 120)), expect_login=True)
-                if not ok:
+                ).ensure(wait, expect_login=expect_login)
+                if not ok and not quiet:
                     log.warning("后台自动登录超时，请检查账号密码")
             except Exception as exc:
-                log.warning(f"后台自动登录异常: {exc}")
+                if not quiet:
+                    log.warning(f"后台自动登录异常: {exc}")
 
     t = threading.Thread(target=_login, daemon=True)
     t.start()
     return t
+
+
+def _mark_login(engine: ExcelEngine, launched_now: bool, login_done: bool) -> ExcelEngine:
+    """给引擎打上启动/登录状态，供 run_flow 判断是否还要再等登录框。
+
+    launched_now: 本次是否由本函数启动了 Excel（AO 登录框可能还没弹出来）。
+    login_done:   启动阶段是否已经处理过登录（后台登录线程已结束或无需登录）。
+    """
+    engine.launched_now = launched_now
+    engine.login_done = login_done
+    return engine
 
 
 def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False, wait_sec: int = 180):
@@ -100,7 +116,12 @@ def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False, wait_sec: int =
         try:
             engine = ExcelEngine(timeout_sec=3)
             engine.find_workbook(pattern)
-            return engine
+            # 复用已有 Excel：用户可能刚打开导航表、登录框还没弹出来。
+            # 起一个后台线程守候登录框（没出现就按超时自行退出），
+            # 这样随后卡在模态登录框上的导航表/刷新调用会被自动解锁。
+            if _start_ao_login(flow_cfg, quiet=True, timeout=60) is not None:
+                return _mark_login(engine, launched_now=False, login_done=True)
+            return _mark_login(engine, launched_now=False, login_done=False)
         except ExcelError:
             pass
 
@@ -129,7 +150,9 @@ def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False, wait_sec: int =
     if source == "bw":
         from .bw_open import open_navigator_from_bw
 
-        return open_navigator_from_bw(flow_cfg, wait_sec=wait_sec)
+        engine = open_navigator_from_bw(flow_cfg, wait_sec=wait_sec)
+        # bw_open 内部检测到登录框时会自动填写并等它关闭，走到这里说明登录已处理
+        return _mark_login(engine, launched_now=True, login_done=True)
 
     if not path or not path.exists():
         raise ExcelError(
@@ -161,8 +184,11 @@ def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False, wait_sec: int =
             log.info("导航表已打开，等待 AO 加载…")
             time.sleep(10)
             if login_t is not None:
-                login_t.join(timeout=60)  # 等登录结束，保证后续切版本/刷新时已连上 BPC
-            return engine
+                login_t.join(timeout=90)  # 等登录结束，保证后续切版本/刷新时已连上 BPC
+            login_done = login_t is None or not login_t.is_alive()
+            if login_t is not None and not login_done:
+                log.warning("后台自动登录仍未结束，交由 run_flow 继续等待登录框")
+            return _mark_login(engine, launched_now=True, login_done=login_done)
         except ExcelError:
             continue
     raise ExcelError(f"等待导航表打开超时（{wait_sec}s）")

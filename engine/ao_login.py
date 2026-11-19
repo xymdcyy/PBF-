@@ -18,6 +18,8 @@ import time
 
 import uiautomation as auto
 
+from .sendkeys import escape_sendkeys
+
 log = logging.getLogger(__name__)
 
 LOGIN_TITLE = "登录到系统 TCL BPC PRD"
@@ -78,7 +80,8 @@ class AoLogin:
         auto.SendKeys("{Delete}")
         time.sleep(0.1)
         if text:
-            auto.SendKeys(text)
+            # 密码可能含 + ^ % ~ ( ) { } —— 不转义会被 SendKeys 当控制字符
+            auto.SendKeys(escape_sendkeys(text))
         time.sleep(0.3)
 
     @staticmethod

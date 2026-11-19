@@ -60,6 +60,15 @@ def is_disconnect(exc: BaseException) -> bool:
     return any(marker in text for marker in _DISCONNECT_MARKERS)
 
 
+def _macro_timeout_sec() -> float:
+    """宏运行多久后开始告警（秒）。PBF_MACRO_TIMEOUT_SEC<=0 禁用。"""
+    try:
+        value = float(os.environ.get("PBF_MACRO_TIMEOUT_SEC", "900"))
+    except ValueError:
+        value = 900.0
+    return value if value > 0 else 0.0
+
+
 class ExcelEngine:
     """Connects to the active Excel process (must already be running with AO)."""
 
@@ -282,7 +291,7 @@ class ExcelEngine:
                 name = self._retry(lambda: wb.Name)
                 full = f"'{name}'!{macro_name}"
             return self._run_with_dialog_guard(
-                lambda: self._retry(lambda: self._excel.Run(full, *args)))
+                lambda: self._retry(lambda: self._excel.Run(full, *args)), label=full)
         except Exception as exc:
             raise ExcelError(f"macro {full}: {exc}") from exc
 
@@ -344,22 +353,31 @@ class ExcelEngine:
         return False
 
     def _dismiss_dialogs_loop(self, pid: int, stop, seen: list[str]) -> None:
-        """后台线程：不断关闭 PBF 的提示弹窗。只处理提示类弹窗，不认识的一律放过。"""
+        """后台线程：关闭 PBF 的提示弹窗，并记录所有模态弹窗。
+
+        只有已知的提示类弹窗会被自动点掉；不认识的弹窗一律不碰，但会记录
+        文本——宏卡住时日志里至少能看到是哪个弹窗挡住了。
+        """
+        known = ("没有要保存", "请检查", "PBF")
         while not stop.is_set():
             try:
                 for hwnd in self._iter_dialogs(pid):
                     text = self._dialog_text(hwnd)
-                    if not any(k in text for k in ("没有要保存", "请检查", "PBF")):
-                        continue
+                    recognized = any(k in text for k in known)
                     if text not in seen:
                         seen.append(text)
-                        log.warning(f"检测到弹窗并自动关闭: {text}")
-                    self._press_default_button(hwnd)
+                        if recognized:
+                            log.warning(f"检测到弹窗并自动关闭: {text}")
+                        else:
+                            log.warning(
+                                f"检测到未识别的模态弹窗（未自动关闭，可能阻塞流程）: {text}")
+                    if recognized:
+                        self._press_default_button(hwnd)
             except Exception:
                 pass
             time.sleep(0.4)
 
-    def _run_with_dialog_guard(self, fn):
+    def _run_with_dialog_guard(self, fn, label: str = ""):
         import threading
 
         self.last_dialogs = []
@@ -372,6 +390,24 @@ class ExcelEngine:
                              args=(pid, stop, self.last_dialogs), daemon=True).start()
         except Exception as exc:
             log.debug(f"弹窗看门狗启动失败（不影响主流程）: {exc}")
+
+        started = time.time()
+        limit = _macro_timeout_sec()
+
+        def watchdog() -> None:
+            """COM 调用无法从外部安全打断，这里只负责在超时后持续告警。"""
+            warned_at = 0.0
+            while not stop.wait(5.0):
+                elapsed = time.time() - started
+                if limit and elapsed >= limit and elapsed - warned_at >= 60:
+                    warned_at = elapsed
+                    dialogs = "；".join(self.last_dialogs[-3:]) or "无"
+                    log.error(
+                        f"宏 {label or '(未命名)'} 已运行 {elapsed:.0f}s（阈值 {limit:.0f}s），"
+                        f"可能被弹窗或 BPC 请求阻塞。近期弹窗：{dialogs}。"
+                        "请在 Excel 中处理后重试，或在 Web 界面点「取消」终止流程。")
+
+        threading.Thread(target=watchdog, daemon=True).start()
         try:
             return fn()
         finally:
