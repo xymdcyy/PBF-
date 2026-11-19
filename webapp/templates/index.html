@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PBF 滚动预测自动编制</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>PBF 滚动预测自动编制</h1>
+    <p class="sub">上传模板 → 自动导出 → 填入 SAP AO → 核对损益</p>
+  </header>
+
+  <main>
+    <!-- 1. 账号 -->
+    <section class="card">
+      <h2>① 账号</h2>
+      <div class="grid">
+        <label>用户名
+          <input id="username" type="text" placeholder="your.name" autocomplete="username">
+        </label>
+        <label>密码
+          <input id="password" type="password" placeholder="登录 SAP BPC 的密码" autocomplete="current-password">
+        </label>
+        <label>客户端
+          <input id="client" type="text" value="333">
+        </label>
+        <label>语言
+          <input id="lang" type="text" value="zh">
+        </label>
+      </div>
+      <div class="row">
+        <button id="btn-save-cred" class="primary">保存账号</button>
+        <span id="cred-status" class="status"></span>
+      </div>
+    </section>
+
+    <!-- 2. 编制参数 -->
+    <section class="card">
+      <h2>② 编制参数</h2>
+      <div class="grid">
+        <label>品牌 × 品类
+          <select id="unit"></select>
+        </label>
+        <label>版本
+          <select id="version"></select>
+        </label>
+        <label>期间（1–6 月）
+          <input id="period" type="text" placeholder="2027.01-2027.04（单值/列表/区间）">
+        </label>
+        <label class="check">
+          <input id="switch-version" type="checkbox" checked>
+          运行前先切换版本
+        </label>
+      </div>
+    </section>
+
+    <!-- 3. 上传模板 -->
+    <section class="card">
+      <h2>③ 上传模板表</h2>
+      <div class="row">
+        <input id="file" type="file" accept=".xlsx,.xlsm">
+        <button id="btn-upload" class="primary">上传并导出</button>
+      </div>
+      <div id="upload-result" class="muted"></div>
+    </section>
+
+    <!-- 4. 运行 -->
+    <section class="card">
+      <h2>④ 运行</h2>
+      <div class="row">
+        <button id="btn-env" class="ghost">环境自检</button>
+        <button id="btn-run" class="primary" disabled>运行全流程</button>
+        <button id="btn-clear" class="danger">批量清除填 0</button>
+        <span id="run-status" class="status"></span>
+      </div>
+      <div id="env-result" class="muted"></div>
+
+      <div class="row" style="margin-top:12px">
+        <button id="btn-cancel" class="danger" disabled>取消</button>
+      </div>
+
+      <h3>运行日志</h3>
+      <pre id="log" class="log"></pre>
+
+      <h3>损益核对</h3>
+      <div id="result"></div>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

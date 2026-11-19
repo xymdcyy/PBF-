@@ -1,0 +1,57 @@
+# 除泛智屏_HQ渠道毛上调整表
+# 结构: matrix — 科目 × (期间 × 区域) 三维交叉表
+# 2026-11-11 live 扫描确认: header_row=54(期间) / 55(区域代码) / 56(区域名), 科目列 AA, 数据 57..71
+# 每个期间块 7 列，块内区域顺序固定（见 region_order）
+form_id: HQ_毛上调整
+workbook_pattern: "YCSRW028_除泛智屏_HQ渠道毛上调整表*"
+sheet: "YC_除泛智屏_HQ渠道毛上调整表"
+layout: matrix
+
+# 三行表头：54=期间, 55=区域代码, 56=区域中文名
+header_row: 54
+region_code_row: 55
+region_name_row: 56
+
+mode_cell: null
+mode_label_cell: null
+mode_switch:
+  macro: "Switch_mode"
+  force_set: false
+
+version_cell: "F4"
+
+# 行匹配 — AA 列科目名
+item_column: "AA"
+item_alternate_columns: []
+input_rows: [57, 71]
+skip_rows: []
+
+# 期间块 — 每块 7 列（7 个区域），起始列已知
+period_blocks:
+  "2026.11": AI
+  "2026.12": AP
+  "2027":    AW
+  "2027.01": BD
+  "2027.02": BK
+  "2027.03": BR
+  "2027.04": BY            # 按 7 列递推，待现场复核
+
+# 块内区域顺序（R55 实测顺序），写入时按区域名/代码定位列 = block_start + offset
+region_order: [AB, O100, O200, O300, O400, O500, A000]
+region_names:
+  AB:   实业不分区域
+  O100: 亚太销售中心
+  O200: 欧洲销售中心
+  O300: 北美销售中心
+  O400: 中东非销售中心
+  O500: 拉美销售中心
+  A000: 中国营销本部    # 录制写入 BJ68 = 2027.01 × 中国营销本部 ✅
+
+macros:
+  save: "Plan_Save"
+  refresh: "Refresh_Sheet"
+  switch_mode: "Switch_mode"
+
+nav_cell: "AC59"               # CBG_乐华品牌-HQ渠道毛上调整
+
+item_aliases: {}

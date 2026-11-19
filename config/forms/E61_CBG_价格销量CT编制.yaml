@@ -1,0 +1,74 @@
+# CBG 价格&销量&加权CT 编制表 — E61 品类
+# 结构: measure_blocks — (组织+渠道+品牌+产品+型号…) 组合键 × 4 个度量块 × 6 期间
+# 2026-11-11 live 扫描确认: header_row=56, 维度 AA..AG
+#   度量块: 销售单价 AH-AM | 销量(出货口径) AN-AS | 加权CT AT-AY | 销售收入 AZ-BE
+form_id: E61_CBG_价格销量CT编制
+workbook_pattern: "YCSRW026_价格*销量*加权CT编制表_CBG专用*"
+sheet: "价格&销量&加权CT编制表_CBG专用"
+layout: measure_blocks
+
+header_row: 56
+
+mode_cell: null
+mode_label_cell: null
+mode_switch:
+  macro: "Switch_mode"
+  force_set: false
+
+version_cell: "F4"
+
+# 行匹配 — 产品 4 维组合键（模板数据即 4 维：组织/渠道/品牌/产品）
+key_columns:
+  - { column: AA, name: 组织 }
+  - { column: AB, name: 渠道 }
+  - { column: AC, name: 品牌 }
+  - { column: AD, name: 产品 }
+input_rows: [57, 196]          # 行数随产品数变化（实测 57-126，最多到 196）
+skip_rows: []
+
+# 度量块 — 每块 6 列，期间顺序固定 2026.11, 2026.12, 2027.01..2027.04
+measures:
+  销售单价:
+    "2026.11": AH
+    "2026.12": AI
+    "2027.01": AJ
+    "2027.02": AK
+    "2027.03": AL
+    "2027.04": AM
+  销量:
+    "2026.11": AN
+    "2026.12": AO
+    "2027.01": AP
+    "2027.02": AQ
+    "2027.03": AR
+    "2027.04": AS
+  加权CT:
+    "2026.11": AT
+    "2026.12": AU
+    "2027.01": AV
+    "2027.02": AW
+    "2027.03": AX
+    "2027.04": AY
+  销售收入:
+    "2026.11": AZ
+    "2026.12": BA
+    "2027.01": BB
+    "2027.02": BC
+    "2027.03": BD
+    "2027.04": BE
+
+# 数据文件里的列名 → 度量名（源模板表头带后缀）
+measure_aliases:
+  销售单价: ["销售单价（含税）", "销售单价(含税)", "单价（含税）", "单价"]
+  销量: ["销量(出货口径)", "销量（出货口径）", "销量(出货口径)（台）", "销量"]
+  加权CT: ["加权CT", "加权CT价", "CT"]
+  销售收入: ["销售收入", "收入"]
+
+macros:
+  save: "Plan_Save"
+  refresh: "Refresh_Sheet"
+  switch_mode: "Switch_mode"
+
+nav_cell: "AC55"               # CBG-智屏-价格&销量-乐华
+
+item_aliases: {}

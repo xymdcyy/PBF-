@@ -1,0 +1,435 @@
+"""PBF 滚动预测自动编制工具 — 本地 Web 界面。
+
+Flask 只做「壳」：把网页参数落到磁盘（credentials.yaml / data_YYYY.MM），再用
+subprocess 调现有 cli.py 驱动 Excel + AO，流式回传日志。单机单人使用，只绑 127.0.0.1。
+
+启动:  python -m webapp.app    （或 run_web.bat）
+端口:  默认 8765，可用环境变量 PBF_WEB_PORT 覆盖。
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+# 确保项目根在 sys.path（兼容 `python webapp/app.py` 与 `python -m webapp.app`）
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import yaml
+from flask import Flask, jsonify, render_template, request
+
+from paths import app_root
+from engine.periods import parse_periods
+
+APP_ROOT = app_root()
+CONFIG_DIR = APP_ROOT / "config"
+CREDENTIALS_FILE = CONFIG_DIR / "credentials.yaml"
+DIMENSIONS_FILE = CONFIG_DIR / "dimensions.yaml"
+BUSINESS_UNITS_FILE = CONFIG_DIR / "business_units.yaml"
+FLOW_FILE = CONFIG_DIR / "flow.yaml"
+LOG_DIR = APP_ROOT / "logs"
+WEB_RUN_DIR = LOG_DIR / "web"
+
+app = Flask(__name__)
+
+
+# ---------- 配置读取 ----------
+
+def _load_yaml(path: Path, default=None):
+    if not path.exists():
+        return default if default is not None else {}
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return default if default is not None else {}
+
+
+def load_credentials() -> dict:
+    return _load_yaml(CREDENTIALS_FILE, {})
+
+
+def save_credentials(username: str, password: str, client: str, lang: str) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    header = ("# 本机凭据（不要提交到代码库、不要随项目一起发给别人）\n"
+              "# 优先级：环境变量 PBF_USERNAME / PBF_PASSWORD / PBF_CLIENT / PBF_LANG > 本文件 > flow.yaml\n")
+    body = yaml.safe_dump(
+        {"username": username, "password": password, "client": client, "lang": lang},
+        allow_unicode=True, sort_keys=False)
+    CREDENTIALS_FILE.write_text(header + body, encoding="utf-8")
+
+
+def load_versions() -> list[dict]:
+    dims = _load_yaml(DIMENSIONS_FILE)
+    versions = dims.get("versions") or {}
+    return [{"key": k, "display": v} for k, v in versions.items()]
+
+
+def load_business_units() -> dict:
+    return _load_yaml(BUSINESS_UNITS_FILE)
+
+
+def latest_data_dir() -> str:
+    candidates = sorted(p.name for p in APP_ROOT.glob("data_[0-9]*") if p.is_dir())
+    return candidates[-1] if candidates else ""
+
+
+def suggested_period() -> str:
+    """最新数据目录的下一月，供前端默认填入。"""
+    latest = latest_data_dir()
+    m = re.search(r"(\d{4})\.(\d{2})", latest)
+    if not m:
+        return ""
+    y, mo = int(m.group(1)), int(m.group(2))
+    if mo == 12:
+        return f"{y + 1}.01"
+    return f"{y}.{mo + 1:02d}"
+
+
+def _data_dir_name(periods: list[str]) -> str:
+    """导出/运行目录名：单期间 data_YYYY.MM，多期间 data_<首>_<末>。"""
+    first, last = periods[0], periods[-1]
+    return f"data_{first}" if first == last else f"data_{first}_{last}"
+
+
+def _parse_period_spec(spec: str) -> list[str]:
+    """解析期间描述（单值/列表/区间），失败抛 ValueError。"""
+    return parse_periods(spec)
+
+
+# ---------- 子进程运行管理 ----------
+
+# 单机单 Excel 实例，同一时刻只允许一个流程在跑
+RUNS: dict[str, dict] = {}
+RUN_LOCK = threading.Lock()
+
+
+def _child_env() -> dict:
+    env = os.environ.copy()
+    # 让 cli.py 的 print 立即落盘，便于网页实时看到日志
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def _spawn(params: dict) -> str:
+    """启动一次后台运行，返回 run_id。"""
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+    WEB_RUN_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = WEB_RUN_DIR / f"{run_id}.log"
+    report_path = WEB_RUN_DIR / f"{run_id}.json"
+
+    period = params["period"]
+    mode = params.get("mode", "fill")          # "fill" 填数 / "clear" 批量清除
+    data_dir = params.get("data_dir")           # Path，fill 模式必填
+    version_key = params.get("version_key") or ""
+    version_display = params.get("version_display") or ""
+    switch_version = bool(params.get("switch_version"))
+
+    state = {"done": False, "exit_code": None, "log_path": log_path,
+             "report_path": report_path, "started": time.time()}
+    with RUN_LOCK:
+        RUNS[run_id] = state
+
+    def worker() -> None:
+        env = _child_env()
+        cli = str(APP_ROOT / "cli.py")
+
+        def run_step(cmd: list[str]) -> int:
+            return subprocess.run(
+                cmd, cwd=str(APP_ROOT), env=env,
+                stdout=lf, stderr=subprocess.STDOUT).returncode
+
+        with open(log_path, "w", encoding="utf-8") as lf:
+            lf.write(f"[Web] 运行参数: 期间={period} 模式={mode}"
+                     f" 版本={version_display or '(未指定)'} 切换版本={switch_version}\n")
+            lf.flush()
+            if switch_version and version_key:
+                lf.write(f"[Web] 切换版本 → {version_key}\n")
+                lf.flush()
+                rc = run_step([sys.executable, cli, "switch-version", version_key])
+                if rc != 0:
+                    lf.write(f"[Web] 切换版本失败（退出码 {rc}），流程中止。\n")
+                    lf.flush()
+                    state["exit_code"] = rc
+                    state["done"] = True
+                    return
+            if mode == "clear":
+                lf.write("[Web] 开始执行批量清除（生成全 0 并运行）…\n")
+                lf.flush()
+                cmd = [sys.executable, cli, "clear", "--periods", period,
+                       "--run", "--report-file", str(report_path)]
+            else:
+                lf.write("[Web] 开始执行全流程（run-flow）…\n")
+                lf.flush()
+                cmd = [sys.executable, cli, "run-flow", "--data-dir", str(data_dir)]
+                if version_display:
+                    cmd += ["--version", version_display]
+                cmd += ["--report-file", str(report_path)]
+            rc = run_step(cmd)
+            state["exit_code"] = rc
+            state["done"] = True
+
+    threading.Thread(target=worker, daemon=True).start()
+    return run_id
+
+
+# ---------- 环境自检 ----------
+
+def _proc_running(*names: str) -> bool:
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
+                             capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return False
+    upper = out.upper()
+    return any(n.upper() in upper for n in names)
+
+
+def check_env() -> dict:
+    """被动自检，不启动 Excel、不改动任何状态。"""
+    checks = []
+    wps = _proc_running("et.exe", "wps.exe")
+    checks.append({"ok": True, "label": "WPS 状态",
+                   "detail": "WPS 表格在运行（已自动绕开，不影响 Excel 操作）" if wps
+                             else "WPS 未运行"})
+
+    excel_pids = []
+    try:
+        from engine.bootstrap import excel_pids
+        excel_pids = excel_pids()
+    except Exception:
+        pass
+    excel_on = bool(excel_pids)
+    checks.append({"ok": excel_on, "label": "Excel 已运行",
+                   "detail": f"Excel 进程数 {len(excel_pids)}" if excel_on
+                             else "Excel 未运行（点运行时会尝试自动打开导航表）"})
+
+    nav_open = False
+    nav_detail = "未检测"
+    if excel_on:
+        try:
+            import win32com.client
+            xl = win32com.client.GetActiveObject("Excel.Application")
+            if float(str(xl.Version)) < 14:
+                nav_detail = "检测到 WPS 抢占 COM 接口（已自动排除）"
+            else:
+                flow = _load_yaml(FLOW_FILE)
+                pattern = (flow.get("navigator") or {}).get(
+                    "workbook_pattern", "PBF Pro - 全面预算系统流程导航*")
+                prefix = pattern.rstrip("*")
+                names = [w.Name for w in xl.Workbooks]
+                if any(n.startswith(prefix) for n in names):
+                    nav_open = True
+                    nav_detail = "导航表已打开"
+                else:
+                    nav_detail = "真实 Excel 已运行，但导航表未打开（运行时会自动打开）"
+        except Exception as exc:
+            nav_detail = f"导航表未检测到（{str(exc)[:80]}）"
+    checks.append({"ok": nav_open, "label": "AO 导航表",
+                   "detail": nav_detail})
+
+    return {"checks": checks, "excel_on": excel_on, "wps_on": wps}
+
+
+# ---------- API ----------
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/init")
+def api_init():
+    creds = load_credentials()
+    units_cfg = load_business_units()
+    units = []
+    for name, u in (units_cfg.get("units") or {}).items():
+        units.append({
+            "name": name,
+            "enabled": bool(u.get("启用", False)),
+            "brand": u.get("品牌", ""),
+            "category": u.get("品类", ""),
+        })
+    return jsonify({
+        "versions": load_versions(),
+        "brands": units_cfg.get("品牌", []),
+        "categories": units_cfg.get("品类", []),
+        "units": units,
+        "username": creds.get("username", ""),
+        "password_set": bool(creds.get("password")),
+        "client": str(creds.get("client", "333")),
+        "lang": str(creds.get("lang", "zh")),
+        "latest_data_dir": latest_data_dir(),
+        "suggested_period": suggested_period(),
+    })
+
+
+@app.route("/api/credentials", methods=["POST"])
+def api_credentials():
+    data = request.get_json(force=True) or {}
+    username = str(data.get("username", "")).strip()
+    client = str(data.get("client", "333")).strip() or "333"
+    lang = str(data.get("lang", "zh")).strip() or "zh"
+    if not username:
+        return jsonify({"ok": False, "error": "用户名不能为空"}), 400
+    # 密码留空（或前端传 null）→ 保留已保存的密码，不覆盖成空
+    raw_pw = data.get("password")
+    if raw_pw in (None, ""):
+        password = load_credentials().get("password", "")
+    else:
+        password = str(raw_pw)
+    save_credentials(username, password, client, lang)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/upload", methods=["POST"])
+def api_upload():
+    file = request.files.get("file")
+    if file is None or file.filename == "":
+        return jsonify({"ok": False, "error": "未选择文件"}), 400
+    period = str(request.form.get("period", "")).strip()
+    try:
+        periods = _parse_period_spec(period)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": f"期间格式错误：{exc}"}), 400
+
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in (".xlsx", ".xlsm"):
+        return jsonify({"ok": False, "error": f"仅支持 .xlsx / .xlsm，实际为 {suffix}"}), 400
+
+    tmp = WEB_RUN_DIR / f"upload_{uuid.uuid4().hex[:8]}{suffix}"
+    WEB_RUN_DIR.mkdir(parents=True, exist_ok=True)
+    file.save(str(tmp))
+    try:
+        from engine.template_export import export_template
+        out_dir = APP_ROOT / _data_dir_name(periods)
+        rows = export_template(tmp, periods, out_dir)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"导出失败：{exc}"}), 500
+    finally:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+
+    total = sum(rows.values())
+    if total == 0:
+        return jsonify({"ok": False, "error": "导出行数为 0，请确认模板表是否选择了正确的期间/工作簿"}), 400
+    return jsonify({"ok": True, "rows": rows, "total": total, "data_dir": out_dir.name,
+                    "periods": periods})
+
+
+@app.route("/api/run", methods=["POST"])
+def api_run():
+    with RUN_LOCK:
+        if any(not s["done"] for s in RUNS.values()):
+            return jsonify({"ok": False, "error": "已有一个流程在运行，请等待其结束"}), 409
+    data = request.get_json(force=True) or {}
+    period = str(data.get("period", "")).strip()
+    try:
+        periods = _parse_period_spec(period)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": f"期间格式错误：{exc}"}), 400
+    data_dir = APP_ROOT / _data_dir_name(periods)
+    if not data_dir.exists():
+        return jsonify({"ok": False, "error": f"数据目录不存在: {data_dir.name}，请先上传模板导出"}), 400
+    run_id = _spawn({
+        "period": period,
+        "data_dir": data_dir,
+        "mode": "fill",
+        "version_key": data.get("version_key") or "",
+        "version_display": data.get("version_display") or "",
+        "switch_version": bool(data.get("switch_version")),
+    })
+    return jsonify({"ok": True, "run_id": run_id})
+
+
+@app.route("/api/clear", methods=["POST"])
+def api_clear():
+    with RUN_LOCK:
+        if any(not s["done"] for s in RUNS.values()):
+            return jsonify({"ok": False, "error": "已有一个流程在运行，请等待其结束"}), 409
+    data = request.get_json(force=True) or {}
+    period = str(data.get("period", "")).strip()
+    try:
+        periods = _parse_period_spec(period)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": f"期间格式错误：{exc}"}), 400
+    run_id = _spawn({
+        "period": period,
+        "mode": "clear",
+        "version_key": data.get("version_key") or "",
+        "version_display": data.get("version_display") or "",
+        "switch_version": bool(data.get("switch_version")),
+    })
+    return jsonify({"ok": True, "run_id": run_id, "periods": periods})
+
+
+@app.route("/api/run/<run_id>/log")
+def api_run_log(run_id: str):
+    state = RUNS.get(run_id)
+    if state is None:
+        return jsonify({"ok": False, "error": "未知 run_id"}), 404
+    offset = int(request.args.get("offset", 0))
+    try:
+        content = state["log_path"].read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        content = ""
+    new = content[offset:]
+    # 退出码可能被 stderr 的报错码污染，这里统一取进程返回码
+    exit_code = state["exit_code"] if state["done"] else None
+    return jsonify({
+        "ok": True, "done": state["done"], "exit_code": exit_code,
+        "lines": new, "next_offset": len(content),
+    })
+
+
+@app.route("/api/run/<run_id>/result")
+def api_run_result(run_id: str):
+    state = RUNS.get(run_id)
+    if state is None:
+        return jsonify({"ok": False, "error": "未知 run_id"}), 404
+    if not state["done"]:
+        return jsonify({"ok": False, "error": "流程尚未结束"}), 409
+    report = {}
+    if state["report_path"].exists():
+        try:
+            report = json.loads(state["report_path"].read_text(encoding="utf-8"))
+        except Exception:
+            report = {}
+    return jsonify({"ok": True, "exit_code": state["exit_code"], "report": report})
+
+
+@app.route("/api/run/<run_id>/cancel", methods=["POST"])
+def api_run_cancel(run_id: str):
+    state = RUNS.get(run_id)
+    if state is None or state["done"]:
+        return jsonify({"ok": False, "error": "无正在运行的流程"}), 400
+    # 子进程由 worker 线程内的 subprocess.run 持有，这里只能标记取消；
+    # 真正终止 Excel 由 run-flow 自身的恢复机制兜底。记录取消意图。
+    state["cancel_requested"] = True
+    return jsonify({"ok": True, "note": "已请求取消（若已进入 Excel 操作，请等待当前步骤结束或手动关闭 Excel）"})
+
+
+@app.route("/api/env")
+def api_env():
+    return jsonify(check_env())
+
+
+def main() -> None:
+    port = int(os.environ.get("PBF_WEB_PORT", "8765"))
+    print(f"PBF Web 界面已启动: http://127.0.0.1:{port}")
+    print("仅本机可访问（127.0.0.1）。按 Ctrl+C 退出。")
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+
+
+if __name__ == "__main__":
+    main()

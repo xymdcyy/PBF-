@@ -1,0 +1,120 @@
+# PBF 滚动预测全流程编排
+# 由 `python cli.py run-flow` 驱动，严格按业务顺序执行。
+#
+# 顺序依据（业务方确认）：
+#   1 价格&销量&加权CT → 2 客户费用 → 3 HQ渠道毛上调整
+#   → 4 其他成本 → 5 费用及损益其他项 → 6 损益核对
+
+# ---------- AO 登录（检测到登录框时自动填写） ----------
+# 账号密码不写在这里（flow.yaml 会随项目一起传阅）。
+# 放到本机 config/credentials.yaml，或用环境变量 PBF_USERNAME / PBF_PASSWORD 覆盖。
+# 若已用缓存凭据登录、未弹出登录框，则自动跳过。
+login:
+  client: "333"
+  lang: zh
+  timeout: 60
+
+# ---------- 故障自动恢复 ----------
+# Excel/AO 偶发闪退时，自动重开导航表 + 重新登录，并把失败的步骤重做一次
+recovery:
+  enabled: true
+  max_retries: 1                # 每个步骤/核对最多重做 1 次
+  kill_stale_excel: true        # 重连前先结束僵死的 Excel 进程（有别的 Excel 文档时慎用）
+
+# ---------- 写入后落库校验 ----------
+# 每张表保存后：关闭工作簿(不保存) → 经导航表重开 → 读回本次写入的每一格。
+# 任何一格对不上都会中止流程；AO 报「没有要保存的数据」但确有新值时同样判失败。
+verify_writeback:
+  enabled: true
+  tolerance: 0.01        # 数值绝对误差
+  sample: 0              # 0=全量校验；>0=均匀抽样 N 格（提速但可能漏检）
+
+# ---------- 导航表 ----------
+navigator:
+  # 打开方式：
+  #   file = 直接用本地导航表启动 Excel（当前使用）
+  #   bw   = 启动空白 Excel → 文件 → Analysis → 从 SAP BW 平台打开工作簿
+  #          （BW 平台路径的自动化代码保留在 engine/bw_open.py，暂不启用）
+  source: file
+  bw_connection: "TCL BPC PRD"          # source=bw 时使用
+  bw_nav_title: "PBF Pro - 全面预算系统流程导航"
+  workbook_pattern: "PBF Pro - 全面预算系统流程导航*"
+  sheet: "PBF Pro - 全面预算系统流程导航"
+  launch_file: "D:\\代码\\PBF自动工具\\pbf-uploader\\PBF Pro - 全面预算系统流程导航.xlsb"
+  version_cell: "AR45"                 # 版本显示，如"滚动预测2026年11月月初版"
+  refresh_flow_macro: "Refresh_Status"  # "刷新流程"按钮 Button 9
+  open_button_cell: "AT52"             # 选中业务单元行后，AT52 变为"打开"
+  open_wait_sec: 14
+
+# ---------- 运行包执行清单 ----------
+package:
+  workbook_pattern: "PBF Pro运行包执行及日志查看清单*"
+  sheet: "运行包执行及日志查看清单"
+  execute_macro: "Trigger_PS"          # Execute 按钮 Button 7
+  refresh_macro: "Refresh_Sheet"       # Refresh 按钮 Button 12
+  version_cell: "AB60"                 # 清单版本显示
+  status_cell: "AO73"                  # 状态列（已完成 / 运行中）
+  step_cell: "AB73"                    # 运行包步骤名
+  start_cell: "AU73"
+  duration_cell: "AW73"
+  poll_interval_sec: 8
+  max_wait_sec: 180
+
+# ---------- 填表步骤（顺序敏感） ----------
+steps:
+  - form: E61_CBG_价格销量CT编制
+    nav_cell: AC55                     # CBG-智屏-价格&销量-乐华
+    data: 价格销量CT.csv
+    after_save:
+      calc_macro: Execute_PS           # 执行收入计算
+  - form: E61_CBG_客户费用编制
+    nav_cell: AC57                     # CBG-乐华客户费用-乐华
+    data: 客户费用.csv
+    after_save:
+      calc_macro: Execute_PS           # 执行客户费用分摊
+  - form: HQ_毛上调整
+    nav_cell: AC59                     # CBG_乐华品牌-HQ渠道毛上调整
+    data: HQ毛上调整.csv
+    after_close:
+      nav_cell: AC62                   # 毛利之上查询-CBG-乐华
+      packages: [52, 53]               # R52=收入计算  R53=成本计算
+  - form: E61_CBG_其他成本编制
+    nav_cell: AC63                     # CBG-其他成本编制-智屏-乐华
+    data: 其他成本.csv
+    # 本表"打开即为编辑态"，直接写入+保存即可（实测 Plan_Save 约 1.5 秒）。
+    # 切勿调用 Switch_mode —— 调用后会切成只读，保存时弹"没有要保存的资源，请检查！"并阻塞。
+  - form: 费用及损益其他项编制_非海外
+    nav_cell: AC65                     # CBG-智屏-乐华品牌
+    data: 费用及损益其他项.csv
+    after_close:
+      nav_cell: AC70                   # CBG损益查询流程 / CBG-乐华
+      packages: [52]                   # 计算滚动预测损益
+
+# ---------- 损益核对 ----------
+verify:
+  nav_cell: AC70
+  form_row: 54                         # AT54 = 打开 YC_CBG损益查询表N
+  sheet: "CBG整体损益查询表"
+  header_row: 54                       # 期间表头行（用于动态定位列）
+  refresh_before_read: true            # 必须先刷新，否则列停在 2026 全年
+  # 目标期间默认从数据目录名推导（data_2027.03 → 2027.03），一般无需配置；
+  # 需要强制指定时打开下面这行：
+  # target_period: "2027.03"
+  # 需要折叠的年度会自动推导（目标年度的上一年，如 2026）；下面是兜底值
+  collapse_year: "2026"
+  # 版本滚动窗口（月）：目标期间早于版本起始期间直接报错，超出窗口只告警
+  version_window_months: 6
+  indicator_rows:
+    销量: 57
+    净收入: 69
+    端到端净毛利: 86
+    总费用额: 172
+    税后考核净利润: 187
+  # 仅在表头解析失败时兜底使用的固定列
+  periods:
+    2026: AB
+    2027: AC
+    "2027.01": AD
+    "2027.02": AE
+    "2027.03": AF
+    "2027.04": AG

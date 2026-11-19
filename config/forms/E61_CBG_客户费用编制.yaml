@@ -1,0 +1,53 @@
+# CBG 客户费用编制表 — E61 品类
+# 结构: keyed — (渠道 + 科目) 组合键 × 期间矩阵
+# 2026-11-11 live 扫描确认: header_row=56, AA=渠道, AB=科目, 期间 AC..AR
+form_id: E61_CBG_客户费用编制
+workbook_pattern: "YCSRW017_客户费用编制表_CBG专用*"
+sheet: "客户费用编制表_CBG专用"
+layout: keyed
+
+header_row: 56
+
+# 本表无 G51/G52 模式切换格（查询模式直出，AO 允许直接写入）
+mode_cell: null
+mode_label_cell: null
+mode_switch:
+  macro: "Switch_mode"
+  force_set: false
+
+version_cell: "F4"
+
+# 行匹配 — 渠道 + 科目 联合定位
+key_columns:
+  - { column: AA, name: 渠道 }
+  - { column: AB, name: 科目 }
+input_rows: [57, 65]           # 66-68 是 PBF 宏参数行
+skip_rows: [66, 67, 68]
+
+# 期间列 — 全期间 (2026.01 ~ 2027.04)，2027.01 = AO（录制写入位）
+month_columns:
+  "2026.01": AC
+  "2026.02": AD
+  "2026.03": AE
+  "2026.04": AF
+  "2026.05": AG
+  "2026.06": AH
+  "2026.07": AI
+  "2026.08": AJ
+  "2026.09": AK
+  "2026.10": AL
+  "2026.11": AM
+  "2026.12": AN
+  "2027.01": AO
+  "2027.02": AP
+  "2027.03": AQ
+  "2027.04": AR
+
+macros:
+  save: "Plan_Save"
+  refresh: "Refresh_Sheet"
+  switch_mode: "Switch_mode"
+
+nav_cell: "AC57"               # CBG-乐华客户费用-乐华
+
+item_aliases: {}

@@ -1,0 +1,27 @@
+# 业务单元 = 品牌 × 品类。
+# 当前只配好「乐华·电视」；其余单元留待现场确认 nav_cell 后，把 启用 改为 true 并补 steps 即可。
+# 网页界面（webapp）会读取本文件生成「品牌×品类」下拉；未启用的单元灰显「未配置」。
+
+品牌: [TCL, 雷鸟, 乐华]
+品类: [电视, 空调, 冰箱, 洗衣机, TCL商用]
+
+units:
+  乐华·电视:
+    启用: true
+    品牌: 乐华
+    品类: 电视
+    # steps 与 config/flow.yaml 的 steps 顺序一一对应，nav_cell 为导航表业务单元行。
+    steps:
+      - { 表单: 价格销量CT,  nav_cell: AC55 }
+      - { 表单: 客户费用,    nav_cell: AC57 }
+      - { 表单: HQ毛上调整, nav_cell: AC59 }
+      - { 表单: 其他成本,    nav_cell: AC63 }
+      - { 表单: 费用及损益,  nav_cell: AC65 }
+
+  # ---------- 以下为后续扩展预留（启用后需现场确认 nav_cell） ----------
+  TCL·电视:    { 启用: false, 品牌: TCL, 品类: 电视 }
+  雷鸟·电视:   { 启用: false, 品牌: 雷鸟, 品类: 电视 }
+  TCL·空调:    { 启用: false, 品牌: TCL, 品类: 空调 }
+  TCL·冰箱:    { 启用: false, 品牌: TCL, 品类: 冰箱 }
+  TCL·洗衣机:  { 启用: false, 品牌: TCL, 品类: 洗衣机 }
+  TCL·TCL商用: { 启用: false, 品牌: TCL, 品类: TCL商用 }

@@ -1,0 +1,33 @@
+# Dimensions — reusable across all forms.
+# Version member keys follow pattern: C03 + YYYYMM + V1
+versions:
+  C03202609V1: "滚动预测2026年9月月初版"
+  C03202610V1: "滚动预测2026年10月月初版"
+  C03202611V1: "滚动预测2026年11月月初版"
+  C03202612V1: "滚动预测2026年12月月初版"
+  C03202701V1: "滚动预测2027年1月月初版"
+
+# Config for the PBF Pro navigator workbook
+navigator:
+  workbook_pattern: "PBF Pro*全面预算系统流程导航*"
+  nav_sheet: "PBF Pro - 全面预算系统流程导航"
+  # 版本相关单元格（现场核对 2026-11-13）：
+  #   AR45 = 版本显示文本（"滚动预测2026年11月月初版"）
+  #   C20  = ZDCATEGRY 上下文成员（C03202611V1），F20 = 传入表单成员
+  # 注意：E4 是模板自用的"前置流程结束行"，写它会破坏模板逻辑，切勿使用。
+  version_display_cell: "AR45"
+  version_context_cell: "C20"
+  version_member_cell: "F20"
+  # Macro names on navigator workbook
+  refresh_macro: null   # Use generic RefreshAll
+
+# Config for the run-package execution log form（现场核对 2026-11-12）
+runner:
+  workbook_pattern: "PBF Pro运行包执行及日志查看清单*"
+  sheet: "运行包执行及日志查看清单"
+  execute_macro: "Trigger_PS"
+  refresh_macro: "Refresh_Sheet"
+  step_cell: "AB73"      # 运行包步骤名
+  status_cell: "AO73"    # 执行状态（已完成 / 运行中 / 失败）
+  start_cell: "AU73"
+  duration_cell: "AW73"

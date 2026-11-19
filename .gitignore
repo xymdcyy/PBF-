@@ -1,0 +1,36 @@
+# ---------- 凭据（绝不提交） ----------
+config/credentials.yaml
+config/credentials.yml
+.env
+
+# ---------- 运行期产物 ----------
+logs/
+data_*/
+output/
+*.log
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+my_finance_env/
+*.egg-info/
+.pytest_cache/
+
+# ---------- 打包产物 ----------
+*.exe
+*.rar
+dist/
+build/
+
+# ---------- 业务文件 / 本地导航表（含 BPC 数据，不入库） ----------
+*.xlsb
+*.xlsm
+*.xlsx
+*.csv
+
+# ---------- 系统文件 ----------
+Thumbs.db
+.DS_Store
+desktop.ini
