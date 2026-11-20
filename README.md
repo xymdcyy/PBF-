@@ -181,15 +181,30 @@ python -m webapp.app
 
 > 网页底层仍是调用 `cli.py`（子进程），与命令行完全等价，运行结果同样写入 `logs/YYYYMMDD.jsonl`。
 
-### 品牌 × 品类扩展（端口）
+### 品牌 × 品类（业务单元）
 
-业务单元（品牌×品类）集中配在 `config/business_units.yaml`。当前只配好「乐华·电视」；要接新单元（TCL/雷鸟、空调/冰箱/洗衣机/TCL商用）：
+业务单元（品牌×品类）集中配在 `config/business_units.yaml`。选中单元后，`steps[].nav_cell`
+会覆盖 `config/flow.yaml` 的导航行，网页下拉与命令行效果一致：
+
+```bat
+python cli.py units                                   :: 查看/校验品牌×品类配置
+python cli.py run-flow --unit 乐华·电视
+python cli.py clear --periods 2027.01-2027.04 --unit 乐华·电视 --run
+```
+
+- 单元 `steps` 必须与 `flow.yaml` 的 `steps` **顺序一一对应**（`表单` 名用于校验，错位会直接报错）；
+- 可选 `after_close_nav_cell`（运行包导航行）、`verify_nav_cell` / `verify_form_row`（损益核对位置）；
+- 未指定 `--unit` 时沿用 `flow.yaml` 的默认导航行（当前即乐华），保持向后兼容；
+- 导出/运行前会检查 CSV 里 `品牌`/`品类` 列是否整列为空，并在界面或控制台给出 `[数据告警]`。
+
+要接新单元（TCL/雷鸟、空调/冰箱/洗衣机/TCL商用）：
 
 1. 在 AO 里现场确认该单元在导航表上的业务单元行（nav_cell），以及各编制表的工作簿/Sheet/期间列；
 2. 在 `config/business_units.yaml` 对应单元补 `steps` 的 `nav_cell` 并把 `启用` 改为 `true`；
 3. 若该单元用到的编制表结构与现有 `config/forms/*.yaml` 不同，补一份表单配置（可用 `python cli.py scan ... --write` 辅助生成）。
 
-网页层的下拉会自动读 `business_units.yaml`，启用后即可选择。
+启动 `run-flow` 时会先跑一遍单元配置校验（数量/表单对应/nav_cell 重复等），
+网页层的下拉自动读 `business_units.yaml`，启用后即可选择。
 
 ---
 

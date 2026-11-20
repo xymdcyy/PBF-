@@ -30,6 +30,7 @@ from flask import Flask, jsonify, render_template, request
 
 from paths import app_root
 from data_dirs import latest_data_dir as find_latest_data_dir
+from engine.business_units import UnitError, csv_dimension_warnings, default_unit, get_unit
 from engine.periods import parse_periods
 from webapp.runs import RunRegistry, should_hold_slot
 
@@ -95,6 +96,27 @@ def load_versions() -> list[dict]:
 
 def load_business_units() -> dict:
     return _load_yaml(BUSINESS_UNITS_FILE)
+
+
+def _resolve_unit(raw) -> tuple[str, str | None]:
+    """校验前端传来的业务单元；未传则回退到第一个启用单元。
+
+    返回 (unit_name, error)；error 非空表示请求非法。
+    """
+    units_cfg = load_business_units()
+    if not units_cfg.get("units"):
+        return "", None          # 未配置业务单元：按 flow.yaml 默认导航行运行
+    name = str(raw or "").strip()
+    if not name:
+        name = default_unit(units_cfg) or ""
+        if not name:
+            return "", "没有启用的业务单元，请检查 config/business_units.yaml"
+        return name, None
+    try:
+        get_unit(units_cfg, name)
+    except UnitError as exc:
+        return "", str(exc)
+    return name, None
 
 
 def latest_data_dir() -> str:
@@ -246,6 +268,7 @@ def _spawn(params: dict) -> str | None:
     period = params["period"]
     mode = params.get("mode", "fill")          # "fill" 填数 / "clear" 批量清除
     data_dir = params.get("data_dir")           # Path，fill 模式必填
+    unit = params.get("unit") or ""             # 业务单元（品牌×品类）
     version_key = params.get("version_key") or ""
     version_display = params.get("version_display") or ""
     switch_version = bool(params.get("switch_version"))
@@ -262,6 +285,7 @@ def _spawn(params: dict) -> str | None:
         try:
             with open(log_path, "w", encoding="utf-8") as lf:
                 lf.write(f"[Web] 运行参数: 期间={period} 模式={mode}"
+                         f" 业务单元={unit or '(默认)'}"
                          f" 版本={version_display or '(未指定)'} 切换版本={switch_version}\n")
                 lf.flush()
                 if switch_version and version_key:
@@ -282,10 +306,14 @@ def _spawn(params: dict) -> str | None:
                     lf.flush()
                     cmd = [sys.executable, cli, "clear", "--periods", period,
                            "--run", "--report-file", str(report_path)]
+                    if unit:
+                        cmd += ["--unit", unit]
                 else:
                     lf.write("[Web] 开始执行全流程（run-flow）…\n")
                     lf.flush()
                     cmd = [sys.executable, cli, "run-flow", "--data-dir", str(data_dir)]
+                    if unit:
+                        cmd += ["--unit", unit]
                     if version_display:
                         cmd += ["--version", version_display]
                     cmd += ["--report-file", str(report_path)]
@@ -403,6 +431,7 @@ def api_init():
         "brands": units_cfg.get("品牌", []),
         "categories": units_cfg.get("品类", []),
         "units": units,
+        "default_unit": default_unit(units_cfg),
         "username": creds.get("username", ""),
         "password_set": bool(creds.get("password")),
         "client": str(creds.get("client", "333")),
@@ -464,7 +493,8 @@ def api_upload():
     if total == 0:
         return jsonify({"ok": False, "error": "导出行数为 0，请确认模板表是否选择了正确的期间/工作簿"}), 400
     return jsonify({"ok": True, "rows": rows, "total": total, "data_dir": out_dir.name,
-                    "periods": periods})
+                    "periods": periods,
+                    "warnings": csv_dimension_warnings(out_dir)})
 
 
 @app.route("/api/run", methods=["POST"])
@@ -475,12 +505,16 @@ def api_run():
         periods = _parse_period_spec(period)
     except ValueError as exc:
         return jsonify({"ok": False, "error": f"期间格式错误：{exc}"}), 400
+    unit, unit_error = _resolve_unit(data.get("unit"))
+    if unit_error:
+        return jsonify({"ok": False, "error": unit_error}), 400
     data_dir = APP_ROOT / _data_dir_name(periods)
     if not data_dir.exists():
         return jsonify({"ok": False, "error": f"数据目录不存在: {data_dir.name}，请先上传模板导出"}), 400
     run_id = _spawn({
         "period": period,
         "data_dir": data_dir,
+        "unit": unit,
         "mode": "fill",
         "version_key": data.get("version_key") or "",
         "version_display": data.get("version_display") or "",
@@ -499,8 +533,12 @@ def api_clear():
         periods = _parse_period_spec(period)
     except ValueError as exc:
         return jsonify({"ok": False, "error": f"期间格式错误：{exc}"}), 400
+    unit, unit_error = _resolve_unit(data.get("unit"))
+    if unit_error:
+        return jsonify({"ok": False, "error": unit_error}), 400
     run_id = _spawn({
         "period": period,
+        "unit": unit,
         "mode": "clear",
         "version_key": data.get("version_key") or "",
         "version_display": data.get("version_display") or "",

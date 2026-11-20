@@ -50,9 +50,10 @@ async function init() {
     opt.disabled = !u.enabled;
     unitSel.appendChild(opt);
   }
-  // 默认选第一个启用的
+  // 默认选服务端指定的启用单元（否则取第一个启用的）
   const firstEnabled = INIT.units.find((u) => u.enabled);
-  if (firstEnabled) unitSel.value = firstEnabled.name;
+  if (INIT.default_unit) unitSel.value = INIT.default_unit;
+  else if (firstEnabled) unitSel.value = firstEnabled.name;
 
   // 版本
   const verSel = $("version");
@@ -119,8 +120,11 @@ $("btn-upload").addEventListener("click", async () => {
   uploadedPeriod = period;
   hasUploaded = true;
   const lines = Object.entries(r.rows).map(([k, v]) => `  ${k}: ${v} 行`);
-  $("upload-result").textContent =
-    `导出成功，共 ${r.total} 行 → ${r.data_dir}/\n` + lines.join("\n");
+  let text = `导出成功，共 ${r.total} 行 → ${r.data_dir}/\n` + lines.join("\n");
+  if (r.warnings && r.warnings.length) {
+    text += "\n⚠ " + r.warnings.join("\n⚠ ");
+  }
+  $("upload-result").textContent = text;
   $("btn-run").disabled = false;
 });
 
@@ -141,6 +145,7 @@ $("btn-run").addEventListener("click", async () => {
   const verDisplay = INIT.versions.find((v) => v.key === verKey)?.display || "";
   const body = {
     period,
+    unit: $("unit").value,
     version_key: verKey,
     version_display: verDisplay,
     switch_version: $("switch-version").checked && !!verKey,
@@ -172,6 +177,7 @@ $("btn-clear").addEventListener("click", async () => {
   const verDisplay = INIT.versions.find((v) => v.key === verKey)?.display || "";
   const body = {
     period,
+    unit: $("unit").value,
     version_key: verKey,
     version_display: verDisplay,
     switch_version: $("switch-version").checked && !!verKey,
