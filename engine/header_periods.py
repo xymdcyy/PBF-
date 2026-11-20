@@ -42,6 +42,22 @@ def month_candidate(v: Any) -> tuple[int, int] | None:
     return None
 
 
+def _ambiguous_month(v: Any) -> bool:
+    """值是否属于 1 月/10 月两义的表示。
+
+    两义的只有：浮点（2027.1）与未补零文本（"2027.1" / "2027-1"）。
+    明确写法——零填充文本 "2027.01"、"2027年1月"、日期——不存在歧义，
+    损益表头出现重复的 1 月块时不能被改判成 10 月。
+    """
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float)):
+        return True
+    if isinstance(v, str):
+        return bool(re.match(r"^\d{4}\s*[.\-/]\s*\d$", v.strip()))
+    return False
+
+
 def normalize_period_header(v: Any, prev: tuple[int, int] | None = None
                             ) -> tuple[str, tuple[int, int] | None]:
     """单元格值 → (表头键, 更新后的 prev)。
@@ -52,13 +68,16 @@ def normalize_period_header(v: Any, prev: tuple[int, int] | None = None
 
     prev 用于消歧：浮点 2027.1 既可能是 1 月也可能是 10 月，若按 1 月会
     相对上一个期间倒退，则判为 10 月（与 FormScanner 的规则一致）。
+    消歧只作用于两义表示（浮点 / 未补零文本）；"2027.01"、日期是明确的
+    1 月，重复的 1 月块照原样返回。
     """
     if v is None:
         return "", prev
     cand = month_candidate(v)
     if cand:
         y, m = cand
-        if m == 1 and prev is not None and (y, 1) <= prev:
+        if (m == 1 and prev is not None and (y, 1) <= prev
+                and _ambiguous_month(v)):
             m = 10
         return f"{y}.{m:02d}", (y, m)
     if isinstance(v, bool):

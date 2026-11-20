@@ -191,7 +191,14 @@ class PbfFlow:
             return False
 
         login_cfg = login_config(self.cfg)
-        if login_cfg.get("username") and not getattr(self.engine, "login_done", False):
+        # 启动阶段的后台登录线程以结果句柄为准：成功才跳过登录，
+        # 失败/未确认都要在这里重新同步登录，不能把"线程已结束"当已登录
+        handle = getattr(self.engine, "login_handle", None)
+        if handle is not None and not handle.finished:
+            handle.wait(float(login_cfg.get("timeout", 120)) + 30)
+        login_confirmed = bool(getattr(self.engine, "login_done", False)) or (
+            handle is not None and handle.finished and bool(handle.outcome))
+        if login_cfg.get("username") and not login_confirmed:
             from .ao_login import AoLogin
 
             ok = AoLogin(
@@ -204,7 +211,7 @@ class PbfFlow:
             if not ok:
                 log.error("恢复后自动登录失败")
                 return False
-        elif getattr(self.engine, "login_done", False):
+        elif login_confirmed:
             log.info("启动阶段已处理 AO 登录，恢复流程跳过重复登录")
         # AO 刚登录完导航表还在加载，等它可读再交还给调用方
         try:
@@ -681,18 +688,35 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
         log.info("启动阶段已处理 AO 登录，跳过重复登录")
         report["login"] = True
     elif login_cfg.get("username"):
-        from .ao_login import AoLogin
-        ok = AoLogin(
-            username=login_cfg["username"],
-            password=login_cfg.get("password", ""),
-            client=str(login_cfg.get("client", "333")),
-            lang=str(login_cfg.get("lang", "zh")),
-        ).ensure(float(login_cfg.get("timeout", 60)),
-                 # 刚由本工具启动 Excel 时，登录框还没弹出来，必须等它出现
-                 expect_login=bool(getattr(engine, "launched_now", False)))
-        if not ok:
-            raise ExcelError("AO 自动登录失败，请手动登录后重试")
-        report["login"] = True
+        # 启动阶段可能起过后台登录线程：以句柄里的"登录成功信号"为准，
+        # 不能拿"线程已启动/已结束"当成功——密码错误时线程照样退出，
+        # 若被当成已登录，后续 COM 调用会被模态登录框永久阻塞
+        handle = getattr(engine, "login_handle", None)
+        if handle is not None and not handle.finished:
+            handle.wait(float(login_cfg.get("timeout", 60)) + 30)
+        if handle is not None and handle.finished and handle.outcome:
+            log.info("启动阶段后台登录已成功，跳过重复登录")
+            report["login"] = True
+        else:
+            if handle is not None and handle.finished and not handle.outcome \
+                    and handle.saw_box:
+                # 见过登录框但没登录成功：密码错误或登录框卡住，
+                # 继续跑只会把清晰的报错变成 COM 挂死
+                raise ExcelError(
+                    f"AO 自动登录失败（{handle.error or '超时或密码错误'}），"
+                    "登录框可能仍在——请手动登录后重试")
+            from .ao_login import AoLogin
+            ok = AoLogin(
+                username=login_cfg["username"],
+                password=login_cfg.get("password", ""),
+                client=str(login_cfg.get("client", "333")),
+                lang=str(login_cfg.get("lang", "zh")),
+            ).ensure(float(login_cfg.get("timeout", 60)),
+                     # 刚由本工具启动 Excel 时，登录框还没弹出来，必须等它出现
+                     expect_login=bool(getattr(engine, "launched_now", False)))
+            if not ok:
+                raise ExcelError("AO 自动登录失败，请手动登录后重试")
+            report["login"] = True
 
     rcfg = flow_cfg.get("recovery") or {}
     recovery_on = bool(rcfg.get("enabled", True))

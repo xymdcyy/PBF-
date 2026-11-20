@@ -39,6 +39,8 @@ class AoLogin:
         self.password = password
         self.client = client
         self.lang = lang
+        # ensure() 期间是否见过登录框：区分"密码错误/登录框卡住"与"从未弹框"
+        self.saw_login_box = False
 
     # ---------- 元素查找 ----------
 
@@ -173,6 +175,7 @@ class AoLogin:
 
                 if self._find_login(0.5):
                     saw_login = True
+                    self.saw_login_box = True
                     log.info("检测到 AO 登录框，开始自动登录")
                     self._fill_and_submit()
                     time.sleep(5)

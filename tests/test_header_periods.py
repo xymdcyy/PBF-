@@ -63,6 +63,27 @@ class NormalizePeriodHeaderTest(unittest.TestCase):
         key, prev = hp.normalize_period_header(2027.01, prev)
         self.assertEqual(key, "2027.10")
 
+    def test_unpadded_text_january_is_disambiguated_by_sequence(self):
+        # 未补零文本 "2027.1" 同样两义：序列不递增时按 10 月
+        key, prev = hp.normalize_period_header("2027.1")
+        self.assertEqual(key, "2027.01")
+        key, _ = hp.normalize_period_header("2027.1", prev)
+        self.assertEqual(key, "2027.10")
+
+    def test_padded_text_duplicate_january_stays_january(self):
+        # "2027.01" 是明确的 1 月：重复的月份块不能被改判成 10 月
+        key, prev = hp.normalize_period_header("2027.01")
+        self.assertEqual(key, "2027.01")
+        key, _ = hp.normalize_period_header("2027.01", prev)
+        self.assertEqual(key, "2027.01")
+
+    def test_datetime_duplicate_january_stays_january(self):
+        # 日期同样是明确月份，不受消歧影响
+        key, prev = hp.normalize_period_header(datetime(2027, 1, 1))
+        self.assertEqual(key, "2027.01")
+        key, _ = hp.normalize_period_header(datetime(2027, 1, 1), prev)
+        self.assertEqual(key, "2027.01")
+
 
 if __name__ == "__main__":
     unittest.main()
