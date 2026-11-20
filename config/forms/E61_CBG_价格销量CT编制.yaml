@@ -64,6 +64,11 @@ measure_aliases:
   加权CT: ["加权CT", "加权CT价", "CT"]
   销售收入: ["销售收入", "收入"]
 
+# 由 Excel 内 Execute_PS 运行包计算的度量，CSV 数据里本就没有（writer 缺列即跳过）；
+# 离线校验据此不把 销售收入 当作 CSV 必填列
+computed_measures:
+  - 销售收入
+
 macros:
   save: "Plan_Save"
   refresh: "Refresh_Sheet"

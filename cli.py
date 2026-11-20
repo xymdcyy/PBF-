@@ -101,29 +101,34 @@ def audit_log(action: str, payload: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
 
-def print_issues(issues: list[Issue]) -> tuple[int, int]:
-    """打印校验结果，返回 (错误数, 告警数)。"""
+def print_issues(issues: list[Issue]) -> tuple[int, int, int]:
+    """打印校验结果，返回 (错误数, 告警数, 提示数)。"""
     errors = [i for i in issues if i.level == "error"]
     warnings = [i for i in issues if i.level == "warning"]
+    infos = [i for i in issues if i.level == "info"]
     for i in errors:
         print(f"  ✗ {i.message}")
     for i in warnings:
         print(f"  ! {i.message}")
-    return len(errors), len(warnings)
+    for i in infos:
+        print(f"  · {i.message}")
+    return len(errors), len(warnings), len(infos)
 
 
 def validate_before_run(flow_cfg: dict, form_cfgs: dict[str, dict], data_dir: Path,
-                        check_data: bool = True) -> None:
+                        check_data: bool = True, from_step: int = 1) -> None:
     """启动 Excel 前的离线校验；有错误直接中止。"""
-    issues = check_flow(flow_cfg, form_cfgs, data_dir, check_data=check_data)
+    issues = check_flow(flow_cfg, form_cfgs, data_dir, check_data=check_data,
+                        from_step=from_step)
     if not issues:
         return
     print("\n[配置校验]")
-    errors, warnings = print_issues(issues)
+    errors, warnings, infos = print_issues(issues)
     if errors:
         print(f"\n配置校验未通过（{errors} 个错误，{warnings} 个告警），已中止；未启动 Excel。")
         sys.exit(1)
-    print(f"\n配置校验通过（{warnings} 个告警）")
+    extra = f"，{infos} 条提示" if infos else ""
+    print(f"\n配置校验通过（{warnings} 个告警{extra}）")
 
 
 # ---------- commands ----------
@@ -462,8 +467,9 @@ def cmd_validate(args) -> None:
     if not issues:
         print("  全部通过。")
         return
-    errors, warnings = print_issues(issues)
-    print(f"\n结果：{errors} 个错误，{warnings} 个告警")
+    errors, warnings, infos = print_issues(issues)
+    extra = f"，{infos} 条提示" if infos else ""
+    print(f"\n结果：{errors} 个错误，{warnings} 个告警{extra}")
     if errors:
         sys.exit(1)
 
@@ -486,7 +492,8 @@ def cmd_run_flow(args) -> None:
 
     # 先做离线校验：配置/数据有问题时不要启动 Excel、更不要跑到一半才失败
     validate_before_run(flow_cfg, form_cfgs, data_dir,
-                        check_data=not (args.skip_fill or args.only_verify))
+                        check_data=not (args.skip_fill or args.only_verify),
+                        from_step=args.from_step or 1)
 
     ensure_excel_ready(flow_cfg)
     engine = ExcelEngine()

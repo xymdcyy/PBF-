@@ -18,7 +18,7 @@ LAYOUTS = {"simple", "keyed", "matrix", "measure_blocks"}
 
 @dataclass(frozen=True)
 class Issue:
-    level: str          # "error" | "warning"
+    level: str          # "error" | "warning" | "info"
     message: str
 
     def __str__(self) -> str:
@@ -31,6 +31,10 @@ def _err(msg: str) -> Issue:
 
 def _warn(msg: str) -> Issue:
     return Issue("warning", msg)
+
+
+def _info(msg: str) -> Issue:
+    return Issue("info", msg)
 
 
 # ---------- 期间 ----------
@@ -89,6 +93,8 @@ def _required_data_columns(cfg: dict) -> list[tuple[str, list[str]]]:
 
     measure_blocks 的数据列可能使用度量别名（如“销售单价（含税）”），
     只要命中 canonical 或任一别名即可。
+    `computed_measures` 里声明的度量（如 销售收入，由 Excel 内 Execute_PS
+    计算得到、本就不来自 CSV）不算必填列——与 writer 缺列即跳过的行为一致。
     """
     layout = cfg.get("layout", "simple")
     req: list[tuple[str, list[str]]] = []
@@ -98,7 +104,10 @@ def _required_data_columns(cfg: dict) -> list[tuple[str, list[str]]]:
             req.append((name, [name]))
     if layout == "measure_blocks":
         alias_map = cfg.get("measure_aliases") or {}
+        computed = {str(m) for m in (cfg.get("computed_measures") or [])}
         for measure in (cfg.get("measures") or {}):
+            if str(measure) in computed:
+                continue
             names = [str(measure)] + [str(a) for a in (alias_map.get(measure) or [])]
             req.append((str(measure), names))
         field = str(cfg.get("period_field", "期间"))
@@ -142,7 +151,8 @@ def check_data_file(path: Path, cfg: dict, target_period: str = "") -> tuple[lis
             f"{path.name} 的期间 {uncovered} 在表单配置里没有对应列"
             f"（已配置：{sorted(configured)}）"))
     if target_period and actual and target_period not in actual:
-        issues.append(_warn(
+        # 滚动预测常态：后端月份还没填数，导出时全空行被跳过，目标期间自然缺席
+        issues.append(_info(
             f"{path.name} 不包含目标期间 {target_period}（实际：{sorted(actual)}）"))
 
     # 同一维度键 + 期间重复 → 会写到同一格，后写覆盖先写
@@ -202,6 +212,11 @@ def check_form_config(form_id: str, cfg: dict) -> list[Issue]:
         issues.append(_err(f"{form_id}: simple 布局缺少 item_column"))
     if layout == "measure_blocks" and not cfg.get("measures"):
         issues.append(_err(f"{form_id}: measure_blocks 布局缺少 measures"))
+    unknown_computed = [str(m) for m in (cfg.get("computed_measures") or [])
+                        if str(m) not in (cfg.get("measures") or {})]
+    if unknown_computed:
+        issues.append(_err(
+            f"{form_id}: computed_measures {unknown_computed} 不在 measures 中"))
 
     # 期间列号唯一性（不同期间共用一列会互相覆盖）
     for label, mapping in (("month_columns", cfg.get("month_columns")),
@@ -218,8 +233,12 @@ def check_form_config(form_id: str, cfg: dict) -> list[Issue]:
 # ---------- 全局 ----------
 
 def check_flow(flow_cfg: dict, form_cfgs: dict[str, dict], data_dir: Path,
-               check_data: bool = True) -> list[Issue]:
-    """校验 flow.yaml + 各步骤表单/数据文件。"""
+               check_data: bool = True, from_step: int = 1) -> list[Issue]:
+    """校验 flow.yaml + 各步骤表单/数据文件。
+
+    `from_step`（1 起）与 run-flow --from-step 对齐：前置步骤本次不跑，
+    其数据文件校验一并跳过（"只跑后半段"的断点续跑不再被前置文件拦截）。
+    """
     issues: list[Issue] = []
 
     nav = flow_cfg.get("navigator") or {}
@@ -273,7 +292,7 @@ def check_flow(flow_cfg: dict, form_cfgs: dict[str, dict], data_dir: Path,
         if not step.get("data"):
             issues.append(_err(f"steps[{i}]（{form_id}）缺少 data"))
             continue
-        if check_data:
+        if check_data and i >= from_step:
             path = data_dir / step["data"]
             file_issues, _ = check_data_file(path, form_cfgs[form_id], target_period=target)
             issues.extend(Issue(x.level, f"{form_id}: {x.message}") for x in file_issues)

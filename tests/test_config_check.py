@@ -138,10 +138,12 @@ class DataFileTest(unittest.TestCase):
         issues, _ = cc.check_data_file(path, KEYED)
         self.assertIn("为空", messages(issues))
 
-    def test_target_period_warning(self):
+    def test_target_period_missing_is_info(self):
+        # 目标期间缺席属滚动预测常态（后端月份未填数），info 不计入告警
         path = self._csv("a.csv", "组织,科目,2027.03\nA,B,1\n")
         issues, _ = cc.check_data_file(path, KEYED, target_period="2027.04")
-        self.assertEqual(levels(issues), ["warning"])
+        self.assertEqual(levels(issues), ["info"])
+        self.assertIn("不包含目标期间", messages(issues))
 
     def test_measure_long_duplicate(self):
         path = self._csv(
@@ -160,6 +162,18 @@ class DataFileTest(unittest.TestCase):
             "m.csv", "组织,产品,期间,单价,销量(出货口径)\nA,X,2027.03,1,2\n")
         issues, _ = cc.check_data_file(path, cfg)
         self.assertEqual(levels(issues), [], messages(issues))
+
+    def test_computed_measure_not_required_in_csv(self):
+        # 销售收入类"计算列"由 Excel 内运行包计算，CSV 缺列不报错
+        cfg = dict(MEASURES, computed_measures=["销量"])
+        path = self._csv("m.csv", "组织,产品,期间,单价\nA,X,2027.03,1\n")
+        issues, _ = cc.check_data_file(path, cfg)
+        self.assertEqual(levels(issues), [], messages(issues))
+
+    def test_computed_measure_unknown_in_form_config(self):
+        issues = cc.check_form_config("F2", dict(MEASURES, computed_measures=["收入"]))
+        self.assertIn("computed_measures", messages(issues))
+        self.assertIn("error", levels(issues))
 
 
 class FlowTest(unittest.TestCase):
@@ -217,6 +231,22 @@ class FlowTest(unittest.TestCase):
                                check_data=False)
         # 数据目录仍要求存在，但不检查文件内容
         self.assertIn("数据目录不存在", messages(issues))
+
+    def test_from_step_skips_earlier_data_files(self):
+        # 断点续跑：从第 2 步开始时，第 1 步的数据文件缺失不应拦截
+        flow = dict(self.flow, steps=[
+            {"form": "F1", "nav_cell": "AC57", "data": "nope.csv"},
+            {"form": "F2", "nav_cell": "AC65", "data": "F2.csv",
+             "after_close": {"nav_cell": "AC70", "packages": [52]}},
+        ])
+        (self.data_dir / "F2.csv").write_text(
+            "组织,产品,期间,单价,销量\nA,X,2027.03,1,2\n", encoding="utf-8-sig")
+        full = cc.check_flow(flow, {"F1": KEYED, "F2": MEASURES}, self.data_dir)
+        self.assertIn("不存在", messages(full))
+        issues = cc.check_flow(flow, {"F1": KEYED, "F2": MEASURES}, self.data_dir,
+                               from_step=2)
+        self.assertNotIn("nope.csv", messages(issues))
+        self.assertNotIn("error", levels(issues), messages(issues))
 
 
 if __name__ == "__main__":
