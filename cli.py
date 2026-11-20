@@ -38,6 +38,7 @@ import yaml
 from engine import (ExcelEngine, ExcelError, FormWriter, Navigator, RunPackageRunner,
                     FormReader, FormScanner, ensure_excel_ready, run_flow)
 from engine.clear import clear_data
+from engine.config_check import Issue, check_flow, check_form_config
 from engine.periods import parse_periods
 from engine.template_export import export_template
 from data_dirs import (latest_data_dir as find_latest_data_dir,
@@ -64,9 +65,18 @@ def load_yaml(path: Path) -> dict:
 
 
 def load_form_config(form_id: str) -> dict:
-    candidates = list(CONFIG_DIR.glob(f"{form_id}*.yaml"))
+    candidates = sorted(CONFIG_DIR.glob(f"{form_id}*.yaml"))
     if not candidates:
         raise SystemExit(f"No config found for form_id='{form_id}' under {CONFIG_DIR}")
+    if len(candidates) > 1:
+        # 精确同名优先；否则说明 form_id 有歧义，继续取第一个会静默用错配置
+        exact = CONFIG_DIR / f"{form_id}.yaml"
+        if exact.exists():
+            return load_yaml(exact)
+        names = ", ".join(p.name for p in candidates)
+        raise SystemExit(
+            f"form_id='{form_id}' 匹配到多个配置文件：{names}。"
+            "请改用精确的 form_id，或重命名多余配置。")
     return load_yaml(candidates[0])
 
 
@@ -92,6 +102,36 @@ def audit_log(action: str, payload: dict) -> None:
     record = {"ts": datetime.now().isoformat(), "action": action, **payload}
     with open(fn, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+
+def print_issues(issues: list[Issue]) -> tuple[int, int, int]:
+    """打印校验结果，返回 (错误数, 告警数, 提示数)。"""
+    errors = [i for i in issues if i.level == "error"]
+    warnings = [i for i in issues if i.level == "warning"]
+    infos = [i for i in issues if i.level == "info"]
+    for i in errors:
+        print(f"  ✗ {i.message}")
+    for i in warnings:
+        print(f"  ! {i.message}")
+    for i in infos:
+        print(f"  · {i.message}")
+    return len(errors), len(warnings), len(infos)
+
+
+def validate_before_run(flow_cfg: dict, form_cfgs: dict[str, dict], data_dir: Path,
+                        check_data: bool = True, from_step: int = 1) -> None:
+    """启动 Excel 前的离线校验；有错误直接中止。"""
+    issues = check_flow(flow_cfg, form_cfgs, data_dir, check_data=check_data,
+                        from_step=from_step)
+    if not issues:
+        return
+    print("\n[配置校验]")
+    errors, warnings, infos = print_issues(issues)
+    if errors:
+        print(f"\n配置校验未通过（{errors} 个错误，{warnings} 个告警），已中止；未启动 Excel。")
+        sys.exit(1)
+    extra = f"，{infos} 条提示" if infos else ""
+    print(f"\n配置校验通过（{warnings} 个告警{extra}）")
 
 
 # ---------- commands ----------
@@ -409,6 +449,47 @@ def cmd_clear(args) -> None:
         cmd_run_flow(rf_args)
 
 
+def cmd_validate(args) -> None:
+    """离线校验：flow.yaml / 表单配置 / 数据文件 / 导航表路径，不连接 Excel。"""
+    flow_cfg = load_yaml(ROOT / "config" / "flow.yaml")
+    issues: list[Issue] = []
+
+    form_cfgs: dict[str, dict] = {}
+    for path in sorted(CONFIG_DIR.glob("*.yaml")):
+        try:
+            cfg = load_yaml(path)
+        except Exception as exc:
+            issues.append(Issue("error", f"{path.name} 读取失败：{exc}"))
+            continue
+        form_id = str(cfg.get("form_id") or path.stem)
+        form_cfgs[form_id] = cfg
+        issues.extend(check_form_config(form_id, cfg))
+
+    check_data = not bool(getattr(args, "config_only", False))
+    if args.data_dir:
+        data_dir = Path(args.data_dir)
+    elif check_data:
+        try:
+            data_dir = latest_data_dir()
+        except SystemExit as exc:
+            issues.append(Issue("error", str(exc)))
+            data_dir = ROOT
+    else:
+        data_dir = ROOT
+
+    issues.extend(check_flow(flow_cfg, form_cfgs, data_dir, check_data=check_data))
+
+    print("\n[配置校验]")
+    if not issues:
+        print("  全部通过。")
+        return
+    errors, warnings, infos = print_issues(issues)
+    extra = f"，{infos} 条提示" if infos else ""
+    print(f"\n结果：{errors} 个错误，{warnings} 个告警{extra}")
+    if errors:
+        sys.exit(1)
+
+
 def cmd_run_flow(args) -> None:
     """按业务顺序跑完整 PBF 滚动预测流程。"""
     warn_unrecognized_data_dirs()
@@ -425,6 +506,11 @@ def cmd_run_flow(args) -> None:
     print(f"模式: {'预检干跑（不写入）' if preflight_only else ('跳填表' if args.skip_fill else '填表')}"
           f" | 仅核对: {args.only_verify}"
           + (f" | 从步骤 {args.from_step} 开始" if args.from_step else "") + "\n")
+
+    # 先做离线校验：配置/数据有问题时不要启动 Excel、更不要跑到一半才失败
+    validate_before_run(flow_cfg, form_cfgs, data_dir,
+                        check_data=not (args.skip_fill or args.only_verify),
+                        from_step=args.from_step or 1)
 
     ensure_excel_ready(flow_cfg)
     engine = ExcelEngine()
@@ -570,6 +656,10 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--nav-cell", help="Navigator cell, e.g. AC65")
     sc.add_argument("--write", action="store_true", help="Write derived config back to YAML")
 
+    vd = sub.add_parser("validate", help="离线校验配置与数据（不连接 Excel）")
+    vd.add_argument("--data-dir", help="数据目录，默认取最新的 data_YYYY.MM")
+    vd.add_argument("--config-only", action="store_true", help="只校验配置，不检查数据文件")
+
     rf = sub.add_parser("run-flow", help="按业务顺序跑完整流程（填表→计算→运行包→核对）")
     rf.add_argument("--data-dir", help="数据目录，默认取最新的 data_YYYY.MM")
     rf.add_argument("--skip-fill", action="store_true", help="跳过填表，只跑计算/运行包/核对")
@@ -618,6 +708,7 @@ def main() -> None:
          "scan": cmd_scan,
          "export": cmd_export,
          "clear": cmd_clear,
+         "validate": cmd_validate,
          "run-flow": cmd_run_flow}[args.cmd](args)
     except ExcelError as exc:
         print(f"\n[ExcelError] {exc}", file=sys.stderr)
