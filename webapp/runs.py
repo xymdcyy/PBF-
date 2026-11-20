@@ -54,3 +54,17 @@ class RunRegistry:
                     if s.get("done") and rid != self._current]
         for rid in finished[:len(self._runs) - self._max_kept]:
             self._runs.pop(rid, None)
+
+
+def should_hold_slot(state: dict, proc_alive: bool, excel_running: bool) -> bool:
+    """取消/超时后是否继续占用运行槽位。
+
+    占位的目的：子进程没被确认终止，或 COM 启动的 Excel 还在跑（它不属于
+    子进程树，taskkill /T 杀不到），此时放行新流程会出现两个流程操作同一
+    个 Excel。子进程确认死亡、Excel 也退出后才放行。
+    """
+    if proc_alive:
+        return True
+    if state.get("timed_out") or state.get("cancelled"):
+        return excel_running
+    return False

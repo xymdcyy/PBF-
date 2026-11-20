@@ -30,7 +30,7 @@ from flask import Flask, jsonify, render_template, request
 
 from paths import app_root
 from engine.periods import parse_periods
-from webapp.runs import RunRegistry
+from webapp.runs import RunRegistry, should_hold_slot
 
 APP_ROOT = app_root()
 CONFIG_DIR = APP_ROOT / "config"
@@ -129,7 +129,9 @@ def _parse_period_spec(spec: str) -> list[str]:
 # 单机单 Excel 实例，同一时刻只允许一个流程在跑（begin 原子抢占，避免竞态）
 REGISTRY = RunRegistry()
 RUN_TIMEOUT_ENV = "PBF_RUN_TIMEOUT_SEC"
-RUN_TIMEOUT_DEFAULT_SEC = 3600          # 0 或负数表示不限时
+# 默认不限时：财务长流程（多期间 + 三个运行包 + 落库校验）可能超过 1 小时，
+# 强杀会把 Excel 停在保存/核对中途。需要限时用 PBF_RUN_TIMEOUT_SEC 显式设置
+RUN_TIMEOUT_DEFAULT_SEC = 0
 
 
 def _child_env() -> dict:
@@ -142,7 +144,7 @@ def _child_env() -> dict:
 
 
 def _run_timeout_sec() -> float | None:
-    """单次子进程运行超时（秒）；PBF_RUN_TIMEOUT_SEC<=0 表示不限时。"""
+    """单次子进程运行超时（秒）；PBF_RUN_TIMEOUT_SEC 未设置或<=0 表示不限时。"""
     try:
         value = float(os.environ.get(RUN_TIMEOUT_ENV, RUN_TIMEOUT_DEFAULT_SEC))
     except ValueError:
@@ -150,13 +152,50 @@ def _run_timeout_sec() -> float | None:
     return value if value > 0 else None
 
 
-def _kill_tree(pid: int) -> None:
-    """终止子进程及其后代（Windows taskkill /T），忽略失败。"""
+def _kill_tree(pid: int) -> bool:
+    """终止子进程及其后代（Windows taskkill /T），返回是否调用成功。"""
     try:
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True, text=True, timeout=30)
+        r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, text=True, timeout=30)
+        return r.returncode == 0
     except Exception:
-        pass
+        return False
+
+
+def _excel_running() -> bool:
+    """Excel 是否仍在运行；检测失败时按"在运行"处理（宁可多占位，不可抢跑）。"""
+    try:
+        from engine.bootstrap import excel_pids
+        return bool(excel_pids())
+    except Exception:
+        return True
+
+
+def _try_release_stuck_run() -> None:
+    """占位运行卡住时（kill 失败/Excel 未退出），条件解除后自动释放槽位。"""
+    cur = REGISTRY.current
+    if cur is None:
+        return
+    state = REGISTRY.get(cur)
+    if not (state and state.get("stuck") and state.get("done")):
+        return
+    proc = state.get("proc")
+    if proc is not None and proc.poll() is None:
+        return
+    if _excel_running():
+        return
+    state["stuck"] = False
+    REGISTRY.end(cur)
+
+
+def _busy_reason() -> str:
+    """begin 失败时给用户的提示：区分"正常运行中"与"卡住的占位运行"。"""
+    cur = REGISTRY.current
+    state = REGISTRY.get(cur) if cur else None
+    if state and state.get("stuck"):
+        return ("上一次运行被取消/超时后未能确认 Excel 退出，运行槽位仍被占用；"
+                "请手动关闭残留的 EXCEL.EXE 后重试（关闭后本提示自动解除）")
+    return "已有一个流程在运行，请等待其结束"
 
 
 def _run_step(cmd: list[str], lf, state: dict) -> int:
@@ -189,6 +228,9 @@ def _run_step(cmd: list[str], lf, state: dict) -> int:
         try:
             return proc.wait(timeout=20)
         except subprocess.TimeoutExpired:
+            # taskkill 后子进程仍在：绝不放行新流程，槽位保持占用直到确认退出
+            lf.write("[Web] 终止失败，子进程仍在运行；请手动结束该进程后重试。\n")
+            lf.flush()
             return -1
 
 
@@ -209,6 +251,7 @@ def _spawn(params: dict) -> str | None:
     state = {"run_id": run_id, "done": False, "exit_code": None, "cancelled": False,
              "timed_out": False, "proc": None, "log_path": log_path,
              "report_path": report_path, "started": time.time()}
+    _try_release_stuck_run()
     if not REGISTRY.begin(run_id, state):
         return None
 
@@ -254,9 +297,23 @@ def _spawn(params: dict) -> str | None:
             except OSError:
                 pass
         finally:
+            proc = state.get("proc")
             state["proc"] = None
             state["done"] = True
-            REGISTRY.end(run_id)
+            # 取消/超时后只有确认子进程死亡且 Excel 已退出才释放槽位；
+            # 否则两个流程会操作同一个 Excel。卡住的占位在条件解除后由
+            # _try_release_stuck_run() 自动放行。
+            proc_alive = proc is not None and proc.poll() is None
+            if should_hold_slot(state, proc_alive, _excel_running()):
+                state["stuck"] = True
+                try:
+                    with open(log_path, "a", encoding="utf-8") as lf:
+                        lf.write("[Web] 未能确认子进程/Excel 完全退出，运行槽位继续保持"
+                                 "占用；请手动关闭残留的 EXCEL.EXE，关闭后即可重新运行。\n")
+                except OSError:
+                    pass
+            else:
+                REGISTRY.end(run_id)
 
     threading.Thread(target=worker, daemon=True).start()
     return run_id
@@ -428,7 +485,7 @@ def api_run():
         "switch_version": bool(data.get("switch_version")),
     })
     if run_id is None:
-        return jsonify({"ok": False, "error": "已有一个流程在运行，请等待其结束"}), 409
+        return jsonify({"ok": False, "error": _busy_reason()}), 409
     return jsonify({"ok": True, "run_id": run_id})
 
 
@@ -448,7 +505,7 @@ def api_clear():
         "switch_version": bool(data.get("switch_version")),
     })
     if run_id is None:
-        return jsonify({"ok": False, "error": "已有一个流程在运行，请等待其结束"}), 409
+        return jsonify({"ok": False, "error": _busy_reason()}), 409
     return jsonify({"ok": True, "run_id": run_id, "periods": periods})
 
 
@@ -469,6 +526,7 @@ def api_run_log(run_id: str):
         "ok": True, "done": state["done"], "exit_code": exit_code,
         "cancelled": bool(state.get("cancelled")),
         "timed_out": bool(state.get("timed_out")),
+        "stuck": bool(state.get("stuck")),
         "lines": new, "next_offset": len(content),
     })
 
@@ -502,7 +560,8 @@ def api_run_cancel(run_id: str):
     proc = state.get("proc")
     if proc is not None and proc.poll() is None:
         _kill_tree(proc.pid)
-        note = "已终止子进程（Excel 若正在执行宏，会在当前调用返回后停下）"
+        note = ("已终止子进程（Excel 由 COM 启动、不在子进程树内，taskkill 杀不到；"
+                "若 Excel 未自动退出请手动关闭，运行槽位会保持占用直到 Excel 退出）")
     else:
         note = "已标记取消；当前步骤尚未启动子进程"
     return jsonify({"ok": True, "note": note})

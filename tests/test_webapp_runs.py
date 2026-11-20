@@ -5,7 +5,28 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from webapp.runs import RunRegistry
+from webapp.runs import RunRegistry, should_hold_slot
+
+
+class ShouldHoldSlotTest(unittest.TestCase):
+    def test_alive_proc_holds(self):
+        # 子进程没被确认终止：无论如何都不放行，避免两个流程操作同一个 Excel
+        self.assertTrue(should_hold_slot({}, proc_alive=True, excel_running=False))
+        self.assertTrue(should_hold_slot({}, proc_alive=True, excel_running=True))
+
+    def test_cancelled_holds_until_excel_exits(self):
+        # Excel 由 COM 启动、不在 taskkill /T 的进程树内：Excel 没退出前占位
+        state = {"cancelled": True}
+        self.assertTrue(should_hold_slot(state, proc_alive=False, excel_running=True))
+        self.assertFalse(should_hold_slot(state, proc_alive=False, excel_running=False))
+
+    def test_timed_out_holds_until_excel_exits(self):
+        state = {"timed_out": True}
+        self.assertTrue(should_hold_slot(state, proc_alive=False, excel_running=True))
+        self.assertFalse(should_hold_slot(state, proc_alive=False, excel_running=False))
+
+    def test_normal_completion_releases(self):
+        self.assertFalse(should_hold_slot({}, proc_alive=False, excel_running=True))
 
 
 class RunRegistryTest(unittest.TestCase):
