@@ -65,8 +65,20 @@ class ExcelEngine:
 
     def __init__(self, timeout_sec: float = 30.0) -> None:
         self._excel = self._connect(timeout_sec)
+        # 记录本实例连接的是哪个 Excel 进程：断线恢复时只结束这个进程，
+        # 不再无差别 taskkill 所有 EXCEL.EXE（避免杀掉用户其它未保存的工作簿）。
+        self.pid = self._excel_pid(self._excel)
         # 最近一次宏执行期间被自动关闭的弹窗文本（供上层判断"没有要保存的数据"这类情况）
         self.last_dialogs: list[str] = []
+
+    @staticmethod
+    def _excel_pid(xl) -> Optional[int]:
+        try:
+            import win32process
+
+            return int(win32process.GetWindowThreadProcessId(int(xl.Hwnd))[1])
+        except Exception:
+            return None
 
     # ---------- connection ----------
 

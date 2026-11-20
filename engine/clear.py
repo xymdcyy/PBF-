@@ -48,11 +48,36 @@ def _collect_keys(data_dirs: list[Path], csv_name: str) -> list[dict]:
 
 
 def clear_data(data_dirs: list[Path], periods: list[str], out_dir: Path) -> dict[str, int]:
-    """对所选期间生成全 0 CSV，返回 {文件名: 行数}。"""
+    """对所选期间生成全 0 CSV，返回 {文件名: 行数}。
+
+    输出目录里上一轮的 CSV 会先删除（本次生成 0 行的表不应残留旧文件）；
+    若输出目录与任一数据来源目录相同则直接拒绝，避免覆盖原始上传数据。
+
+    键收集在任何文件被改动之前完成：数据来源里找不到已填项时直接抛错，
+    此时输出目录还保持原样，不会被清空一半。
+    """
+    out_resolved = Path(out_dir).resolve()
+    for d in data_dirs:
+        if Path(d).resolve() == out_resolved:
+            raise ValueError(f"输出目录不能与数据来源目录相同：{d}（会覆盖原始上传数据）")
+
+    collected: dict[str, list[dict]] = {
+        csv_name: _collect_keys(data_dirs, csv_name) for csv_name in FORM_SCHEMA}
+    if not any(collected.values()):
+        raise ValueError(
+            "未在数据来源目录中找到可清除的已填项；"
+            "请检查 --data-dirs（默认取全部 data_* 目录）")
+
     out_dir.mkdir(parents=True, exist_ok=True)
+    for name in FORM_SCHEMA:
+        try:
+            (out_dir / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
     result: dict[str, int] = {}
     for csv_name, (layout, dims, measures) in FORM_SCHEMA.items():
-        keys = _collect_keys(data_dirs, csv_name)
+        keys = collected[csv_name]
         rows: list[dict] = []
         if layout == "长表":
             for k in keys:

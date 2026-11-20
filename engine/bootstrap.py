@@ -34,11 +34,20 @@ def excel_pids() -> list[int]:
     return pids
 
 
-def kill_excel() -> None:
-    log.warning("结束无响应的 Excel 进程…")
+def kill_excel(pid: int | None = None) -> None:
+    """结束 Excel 进程。
+
+    pid 给定 → 只结束该进程（断线恢复的正确做法）；
+    pid 为 None → 结束所有 EXCEL.EXE（仅保留给显式的人工命令，自动流程不要用）。
+    """
+    if pid is None:
+        log.warning("结束所有 Excel 进程…")
+        cmd = ["taskkill", "/IM", "EXCEL.EXE", "/F"]
+    else:
+        log.warning(f"结束 Excel 进程 PID={pid}…")
+        cmd = ["taskkill", "/PID", str(pid), "/T", "/F"]
     try:
-        subprocess.run(["taskkill", "/IM", "EXCEL.EXE", "/F"],
-                       capture_output=True, text=True, timeout=30)
+        subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except Exception as exc:
         log.warning(f"结束 Excel 失败（忽略）: {exc}")
     reset_active_excel()  # 进程已结束，清掉缓存的 COM 引用
@@ -83,7 +92,8 @@ def _start_ao_login(flow_cfg: dict):
     return t
 
 
-def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False, wait_sec: int = 180):
+def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False,
+                       stale_pid: int | None = None, wait_sec: int = 180):
     """确保真实 Excel 已运行且导航表已打开，否则自动打开。
 
     返回可复用的 ExcelEngine（所有成功路径），调用方可复用同一实例，避免重连到别的 Excel。
@@ -117,9 +127,16 @@ def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False, wait_sec: int =
         except ExcelError:
             pass
 
-    # 3) 断开重连时：残留进程可能已经僵死，先结束掉
-    if kill_stale and excel_pids():
-        kill_excel()
+    # 3) 断开重连时：残留进程可能已经僵死，只结束本工具连接的那个 PID。
+    #    定位不到目标时宁可跳过，也不要 taskkill 掉用户其它 Excel（可能有未保存内容）。
+    if kill_stale:
+        running = excel_pids()
+        if stale_pid and stale_pid in running:
+            kill_excel(stale_pid)
+        elif running:
+            log.warning(
+                f"未定位到需要结束的 Excel 进程（目标 PID={stale_pid}），"
+                f"跳过强制结束，避免影响其它 Excel 窗口")
 
     # 4) 打开导航表
     #    source=bw（默认）：启动空白 Excel → 文件 → Analysis → 从 BW 平台现取导航表。

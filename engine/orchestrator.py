@@ -164,8 +164,11 @@ class PbfFlow:
         """
         rcfg = self.cfg.get("recovery") or {}
         log.warning("Excel 连接已断开，开始自动恢复…")
+        # 只结束本流程连接的那个 Excel 进程；不碰用户同时打开的其它 Excel。
+        stale_pid = getattr(self.engine, "pid", None)
         try:
-            ensure_excel_ready(self.cfg, kill_stale=bool(rcfg.get("kill_stale_excel", True)))
+            ensure_excel_ready(self.cfg, kill_stale=bool(rcfg.get("kill_stale_excel", True)),
+                               stale_pid=stale_pid)
             self.engine = ExcelEngine(timeout_sec=20)
         except Exception as exc:
             log.error(f"自动恢复失败：{exc}")

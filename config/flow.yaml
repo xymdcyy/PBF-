@@ -19,7 +19,7 @@ login:
 recovery:
   enabled: true
   max_retries: 1                # 每个步骤/核对最多重做 1 次
-  kill_stale_excel: true        # 重连前先结束僵死的 Excel 进程（有别的 Excel 文档时慎用）
+  kill_stale_excel: true        # 重连前只结束本工具连接的那个 Excel 进程（不会动用户其它 Excel）
 
 # ---------- 写入后落库校验 ----------
 # 每张表保存后：关闭工作簿(不保存) → 经导航表重开 → 读回本次写入的每一格。

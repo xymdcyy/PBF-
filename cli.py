@@ -40,6 +40,9 @@ from engine import (ExcelEngine, ExcelError, FormWriter, Navigator, RunPackageRu
 from engine.clear import clear_data
 from engine.periods import parse_periods
 from engine.template_export import export_template
+from data_dirs import (latest_data_dir as find_latest_data_dir,
+                       list_data_dirs as find_data_dirs,
+                       unrecognized_data_dirs as find_unrecognized_data_dirs)
 from paths import app_root
 
 ROOT = app_root()
@@ -316,20 +319,28 @@ def cmd_scan(args) -> None:
 
 
 def latest_data_dir() -> Path:
-    """默认数据目录：取最新的 data_* 目录；没有则报错提示先导出数据。"""
-    candidates = sorted(p for p in ROOT.glob("data_[0-9]*") if p.is_dir())
-    if not candidates:
+    """默认数据目录：按期间取最新（排除 *_clear）；没有则报错提示先导出数据。"""
+    latest = find_latest_data_dir(ROOT)
+    if latest is None:
         raise SystemExit(
             "未找到任何 data_* 数据目录。请先导出上传数据：\n"
             "  python cli.py export --template 滚动预测模板表.xlsx --periods 2027.01-2027.04\n"
             "或改用 --data-dir 指定已有数据目录。")
-    return candidates[-1]
+    return latest
 
 
 def existing_data_dirs() -> list[Path]:
-    """所有已存在的 data_* 数据目录（排除 *_clear 清除目录）。"""
-    return sorted(p for p in ROOT.glob("data_[0-9]*")
-                  if p.is_dir() and not p.name.endswith("_clear"))
+    """所有已存在的上传数据目录（按期间升序，排除 *_clear 清除目录）。"""
+    return find_data_dirs(ROOT)
+
+
+def warn_unrecognized_data_dirs() -> None:
+    """data_ 前缀但不符合命名规则的目录不参与数据源选择，遇到时提示一句。"""
+    ignored = find_unrecognized_data_dirs(ROOT)
+    if ignored:
+        names = "、".join(p.name for p in ignored)
+        print(f"[提示] 以下 data_ 开头的目录不符合命名规则 data_YYYY.MM"
+              f"（或 data_YYYY.MM_YYYY.MM），未当作数据源：{names}")
 
 
 def default_export_dir(periods: list[str]) -> Path:
@@ -368,6 +379,7 @@ def cmd_export(args) -> None:
 
 def cmd_clear(args) -> None:
     """批量清除：把既有 data_* 目录里填过的数字清成 0，期间可自由选择。"""
+    warn_unrecognized_data_dirs()
     periods = parse_periods(args.periods)
     data_dirs = [Path(d) for d in args.data_dirs] if args.data_dirs else existing_data_dirs()
     out_dir = Path(args.out_dir) if getattr(args, "out_dir", None) else clear_out_dir(periods)
@@ -376,7 +388,11 @@ def cmd_clear(args) -> None:
     print(f"清除期间: {', '.join(periods)}")
     print(f"数据来源: {', '.join(d.name for d in data_dirs)}")
     print(f"输出: {out_dir}")
-    rows = clear_data(data_dirs, periods, out_dir)
+    try:
+        rows = clear_data(data_dirs, periods, out_dir)
+    except ValueError as exc:
+        print(f"\n[清除中止] {exc}")
+        raise SystemExit(1)
     print("\n[清除结果]（全 0）")
     for name, n in rows.items():
         print(f"  {name}: {n} 行")
@@ -395,6 +411,7 @@ def cmd_clear(args) -> None:
 
 def cmd_run_flow(args) -> None:
     """按业务顺序跑完整 PBF 滚动预测流程。"""
+    warn_unrecognized_data_dirs()
     flow_cfg = load_yaml(ROOT / "config" / "flow.yaml")
     form_cfgs = {s["form"]: load_form_config(s["form"]) for s in flow_cfg["steps"]}
     data_dir = Path(args.data_dir) if args.data_dir else latest_data_dir()
