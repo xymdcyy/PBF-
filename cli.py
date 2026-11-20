@@ -514,8 +514,14 @@ def cmd_run_flow(args) -> None:
 # ---------- main ----------
 
 def _init_console() -> None:
-    """打包成 exe 后 stdout 编码可能与控制台代码页不一致（中文变乱码），统一成控制台代码页。"""
+    """打包成 exe 后 stdout 编码可能与控制台代码页不一致（中文变乱码），统一成控制台代码页。
+
+    仅当输出是真实控制台（isatty）时才改。Web 界面把 stdout 重定向到管道，父进程按
+    UTF-8 读日志；这里若再改成 cp936 会写出乱码。管道场景沿用 PYTHONIOENCODING。
+    """
     try:
+        if not (hasattr(sys.stdout, "isatty") and sys.stdout.isatty()):
+            return
         import ctypes
 
         cp = ctypes.windll.kernel32.GetConsoleOutputCP()
