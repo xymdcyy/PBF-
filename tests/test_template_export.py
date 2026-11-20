@@ -94,6 +94,15 @@ class ExportTests(unittest.TestCase):
             else:
                 self.assertIn("期间", header, f"{name} 表头缺期间字段")
 
+    def test_failed_export_keeps_previous_output(self) -> None:
+        # 导出先写临时目录，全部成功后才替换：模板读不了时不破坏上一轮 CSV
+        self._write_stale()
+        with self.assertRaises(FileNotFoundError):
+            export_template(self.out.parent / "不存在的模板.xlsx", ["2027.01"], self.out)
+        for name in EXPORT_FILES:
+            self.assertEqual((self.out / name).read_text(encoding="utf-8"), "OLD\n",
+                             f"{name} 在导出失败后被清掉了")
+
 
 if __name__ == "__main__":
     unittest.main()

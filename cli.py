@@ -41,7 +41,8 @@ from engine.clear import clear_data
 from engine.periods import parse_periods
 from engine.template_export import export_template
 from data_dirs import (latest_data_dir as find_latest_data_dir,
-                       list_data_dirs as find_data_dirs)
+                       list_data_dirs as find_data_dirs,
+                       unrecognized_data_dirs as find_unrecognized_data_dirs)
 from paths import app_root
 
 ROOT = app_root()
@@ -333,6 +334,15 @@ def existing_data_dirs() -> list[Path]:
     return find_data_dirs(ROOT)
 
 
+def warn_unrecognized_data_dirs() -> None:
+    """data_ 前缀但不符合命名规则的目录不参与数据源选择，遇到时提示一句。"""
+    ignored = find_unrecognized_data_dirs(ROOT)
+    if ignored:
+        names = "、".join(p.name for p in ignored)
+        print(f"[提示] 以下 data_ 开头的目录不符合命名规则 data_YYYY.MM"
+              f"（或 data_YYYY.MM_YYYY.MM），未当作数据源：{names}")
+
+
 def default_export_dir(periods: list[str]) -> Path:
     """导出目录：单期间 data_YYYY.MM，多期间 data_<首>_<末>。"""
     first, last = periods[0], periods[-1]
@@ -369,6 +379,7 @@ def cmd_export(args) -> None:
 
 def cmd_clear(args) -> None:
     """批量清除：把既有 data_* 目录里填过的数字清成 0，期间可自由选择。"""
+    warn_unrecognized_data_dirs()
     periods = parse_periods(args.periods)
     data_dirs = [Path(d) for d in args.data_dirs] if args.data_dirs else existing_data_dirs()
     out_dir = Path(args.out_dir) if getattr(args, "out_dir", None) else clear_out_dir(periods)
@@ -377,7 +388,11 @@ def cmd_clear(args) -> None:
     print(f"清除期间: {', '.join(periods)}")
     print(f"数据来源: {', '.join(d.name for d in data_dirs)}")
     print(f"输出: {out_dir}")
-    rows = clear_data(data_dirs, periods, out_dir)
+    try:
+        rows = clear_data(data_dirs, periods, out_dir)
+    except ValueError as exc:
+        print(f"\n[清除中止] {exc}")
+        raise SystemExit(1)
     print("\n[清除结果]（全 0）")
     for name, n in rows.items():
         print(f"  {name}: {n} 行")
@@ -396,6 +411,7 @@ def cmd_clear(args) -> None:
 
 def cmd_run_flow(args) -> None:
     """按业务顺序跑完整 PBF 滚动预测流程。"""
+    warn_unrecognized_data_dirs()
     flow_cfg = load_yaml(ROOT / "config" / "flow.yaml")
     form_cfgs = {s["form"]: load_form_config(s["form"]) for s in flow_cfg["steps"]}
     data_dir = Path(args.data_dir) if args.data_dir else latest_data_dir()

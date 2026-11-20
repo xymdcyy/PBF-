@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _stubs  # noqa: F401  （确保仓库根在 sys.path）
 
 from data_dirs import (data_dir_periods, data_dir_target_period, is_data_dir,
-                       latest_data_dir, list_data_dirs)
+                       latest_data_dir, list_data_dirs, unrecognized_data_dirs)
 
 
 class DataDirTests(unittest.TestCase):
@@ -57,6 +57,14 @@ class DataDirTests(unittest.TestCase):
     def test_latest_none_when_no_data_dir(self) -> None:
         self._mkdir("data_2027.01_2027.04_clear", "logs")
         self.assertIsNone(latest_data_dir(self.root))
+
+    def test_unrecognized_data_dirs(self) -> None:
+        # data_ 前缀但不符合命名规则的目录（不补零、备份、临时目录）单独列出，
+        # 供 CLI 提示；合规目录与 *_clear / 非 data_ 目录不算。
+        self._mkdir("data_2027.03", "data_2027.1", "data_2027.01_bak",
+                    "data_tmp", "data_2027.01_2027.04_clear", "notes")
+        names = [p.name for p in unrecognized_data_dirs(self.root)]
+        self.assertEqual(names, ["data_2027.01_bak", "data_2027.1", "data_tmp"])
 
 
 if __name__ == "__main__":

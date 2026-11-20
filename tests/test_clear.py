@@ -41,6 +41,16 @@ class ClearTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             clear_data([empty], ["2027.01"], self.out)
 
+    def test_no_keys_leaves_output_untouched(self) -> None:
+        # 无可清除键时报错必须发生在删除旧 CSV 之前，输出目录保持原样
+        stale = self.out / "客户费用.csv"
+        stale.write_text("PREVIOUS\n", encoding="utf-8")
+        empty = Path(self._tmp.name) / "data_2026.12"
+        empty.mkdir()
+        with self.assertRaises(ValueError):
+            clear_data([empty], ["2027.01"], self.out)
+        self.assertEqual(stale.read_text(encoding="utf-8"), "PREVIOUS\n")
+
     def test_removes_stale_files_and_writes_zeros(self) -> None:
         for name in FORM_SCHEMA:
             (self.out / name).write_text("OLD\n", encoding="utf-8")

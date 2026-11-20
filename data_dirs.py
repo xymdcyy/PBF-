@@ -59,3 +59,18 @@ def latest_data_dir(root: Path) -> Path | None:
     """最新数据目录；没有则返回 None。"""
     dirs = list_data_dirs(root)
     return dirs[-1] if dirs else None
+
+
+def unrecognized_data_dirs(root: Path) -> list[Path]:
+    """data_ 前缀但不符合命名规则的目录（旧版不补零的 data_2027.1、备份、临时目录等）。
+
+    这些目录不参与数据源选择与“最新目录”判定；列出来供 CLI 提示，
+    避免用户以为数据丢了。*_clear 是批量清除的约定目录名，不算在内。
+    """
+    out: list[Path] = []
+    for p in Path(root).iterdir():
+        if (p.is_dir() and p.name.lower().startswith("data_")
+                and not p.name.endswith("_clear")
+                and not data_dir_periods(p.name)):
+            out.append(p)
+    return sorted(out, key=lambda p: p.name)

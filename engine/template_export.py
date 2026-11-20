@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import csv
 import re
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -98,23 +100,33 @@ def export_template(xlsx_path: Path, periods: Any, out_dir: Path, zero: bool = F
     periods 可为 'YYYY.MM'、'YYYY.MM-YYYY.MM'、'YYYY.MM,YYYY.MM' 或列表。
     zero=True 时所有值填 0（供批量清除复用）。
     公式未缓存（data_only 读不到值）时自动回退 data_only=False 重读。
+
+    先导出到临时目录，5 份 CSV 都生成成功后一次性替换 out_dir 里的旧文件；
+    模板打不开、表单缺失等中途失败不会破坏上一轮的导出结果。
     """
     periods = _normalize_periods(periods)
     if not xlsx_path.exists():
         raise FileNotFoundError(f"模板文件不存在: {xlsx_path}")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    _clean_output(out_dir)
 
     def load(data_only: bool):
         return load_workbook(xlsx_path, read_only=True, data_only=data_only)
 
-    wb = load(True)
-    result = _export(wb, periods, out_dir, zero)
-    if sum(result.values()) == 0:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        wb = load(True)
+        result = _export(wb, periods, tmp_dir, zero)
+        if sum(result.values()) == 0:
+            wb.close()
+            wb = load(False)
+            result = _export(wb, periods, tmp_dir, zero)
         wb.close()
-        wb = load(False)
-        result = _export(wb, periods, out_dir, zero)
-    wb.close()
+        missing = [n for n in EXPORT_FILES if not (tmp_dir / n).exists()]
+        if missing:
+            raise RuntimeError(f"导出不完整，缺少文件: {'、'.join(missing)}")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _clean_output(out_dir)
+        for name in EXPORT_FILES:
+            shutil.move(str(tmp_dir / name), str(out_dir / name))
     return result
 
 
