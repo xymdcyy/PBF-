@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 只读权限：本工作流只跑测试，不发布任何产物
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.14"]
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      # 按提交 SHA 锁定第三方 action（tag 可被移动，SHA 不可变）
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # 测试只覆盖纯逻辑模块（期间解析、配置校验、运行注册表等），
+      # engine/__init__.py 按需导入，因此这里不安装 pywin32/Office 依赖。
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
