@@ -83,24 +83,52 @@ def load_data(path: Path) -> list[dict]:
     return df.to_dict(orient="records")
 
 
-AUDIT_RETENTION_DAYS = int(os.environ.get("PBF_AUDIT_RETENTION_DAYS", "180"))
 _audit_pruned = False
 
 
-def _prune_audit_logs(log_dir: Path = LOG_DIR,
-                      max_age_days: int = AUDIT_RETENTION_DAYS) -> None:
-    """删除超过保留期的审计日志（每次进程只扫描一次）。"""
+def _audit_retention_days() -> int:
+    """审计日志保留天数（天），<=0 表示永不清理。
+
+    审计日志是财务操作留痕，默认不清理；只有显式设置
+    PBF_AUDIT_RETENTION_DAYS（正整数）才会清理过期文件。
+    非法值（非数字 / 0 / 负数）一律告警并按"不清理"处理，
+    不能因为环境变量写错就让所有命令崩在 import 期。
+    """
+    raw = (os.environ.get("PBF_AUDIT_RETENTION_DAYS") or "").strip()
+    if not raw:
+        return 0
+    try:
+        days = int(raw)
+    except ValueError:
+        log.warning("PBF_AUDIT_RETENTION_DAYS=%r 不是数字，忽略（审计日志不清理）", raw)
+        return 0
+    if days <= 0:
+        log.warning("PBF_AUDIT_RETENTION_DAYS=%d 非正数，忽略（审计日志不清理）", days)
+        return 0
+    return days
+
+
+def _prune_audit_logs(log_dir: Path = LOG_DIR) -> None:
+    """删除超过保留期的审计日志（每次进程只扫描一次；未配置保留期时不清理）。"""
     global _audit_pruned
     if _audit_pruned:
         return
     _audit_pruned = True
+    max_age_days = _audit_retention_days()
+    if max_age_days <= 0:
+        return
     cutoff = time.time() - max_age_days * 86400
+    removed = 0
     for f in log_dir.glob("*.jsonl"):
         try:
             if f.stat().st_mtime < cutoff:
                 f.unlink()
+                removed += 1
         except OSError:
             pass
+    if removed:
+        print(f"[审计] 已按 PBF_AUDIT_RETENTION_DAYS={max_age_days} "
+              f"清理 {removed} 个过期审计日志文件")
 
 
 def audit_log(action: str, payload: dict) -> None:

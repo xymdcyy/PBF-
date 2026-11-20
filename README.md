@@ -140,8 +140,14 @@ python -m PyInstaller --noconfirm --onefile --name pbf-uploader --distpath . ^
    --workpath build --specpath build ^
    --hidden-import win32com.client --hidden-import win32com.server.exception ^
    --hidden-import pythoncom --hidden-import comtypes ^
-   --collect-all uiautomation cli.py
+   --collect-all uiautomation ^
+   --collect-submodules engine cli.py
 ```
+
+> `--collect-submodules engine` 不能省：`engine/__init__.py` 是 PEP 562 按需导入
+> （`from engine import ExcelEngine` 走 `__getattr__` 懒加载），PyInstaller 的静态
+> 分析发现不了 `engine.excel` 等子模块，漏掉这条打包出的 exe 启动即
+> `ModuleNotFoundError: engine.excel`。
 
 产物约 82 MB（含 pandas / uiautomation）。
 
@@ -331,5 +337,7 @@ python -m unittest discover -s tests -v
 
 同一套测试可直接接入 CI（Windows + Python 3.10 / 3.12），不需要安装 Office 或 pywin32。
 
-审计日志 `logs/YYYYMMDD.jsonl` 默认保留 180 天，可用环境变量
-`PBF_AUDIT_RETENTION_DAYS` 调整；启动任意命令时自动清理过期文件。
+审计日志 `logs/YYYYMMDD.jsonl` 是财务操作留痕，**默认永不清理**。如需控制
+磁盘占用，显式设置环境变量 `PBF_AUDIT_RETENTION_DAYS`（正整数，单位天），
+例如 `set PBF_AUDIT_RETENTION_DAYS=365`；此后启动任意命令时会自动清理过期
+文件并打印清理数量。非数字 / 0 / 负数均视为未配置（不清理）。
