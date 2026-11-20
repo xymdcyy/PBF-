@@ -16,9 +16,8 @@ from datetime import date, datetime
 from typing import Any
 
 from .excel import ExcelEngine
-
-# 字符串形式的期间: "2026.11" / "2026-11" / "2026年11月"
-_MONTH_STR = re.compile(r"^(\d{4})\s*[.\-/年]\s*(\d{1,2})\s*月?$")
+from .header_periods import MONTH_STR as _MONTH_STR
+from .header_periods import month_candidate as _month_candidate
 
 
 def col_letter(n: int) -> str:
@@ -28,35 +27,6 @@ def col_letter(n: int) -> str:
         n, rem = divmod(n - 1, 26)
         s = chr(65 + rem) + s
     return s
-
-
-def _month_candidate(v: Any) -> tuple[int, int] | None:
-    """把一个单元格值解析成 (年, 月候选)。返回 None 表示不是期间。"""
-    if v is None:
-        return None
-    if isinstance(v, (datetime, date)):
-        return (v.year, v.month)
-    if isinstance(v, bool):
-        return None
-    if isinstance(v, (int, float)):
-        f = float(v)
-        # 纯年份整数（如 2027）不是期间
-        if f == int(f) and 1900 < f < 2100:
-            return None
-        y = int(f)
-        if not (2000 <= y <= 2099):
-            return None
-        m = int(round((f - y) * 100))
-        if 1 <= m <= 12:
-            return (y, m)
-        return None
-    s = str(v).strip()
-    mt = _MONTH_STR.match(s)
-    if mt:
-        y, m = int(mt.group(1)), int(mt.group(2))
-        if 2000 <= y <= 2099 and 1 <= m <= 12:
-            return (y, m)
-    return None
 
 
 def _is_text(v: Any) -> bool:

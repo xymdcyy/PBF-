@@ -18,6 +18,8 @@ import time
 
 import uiautomation as auto
 
+from .sendkeys import escape_sendkeys
+
 log = logging.getLogger(__name__)
 
 LOGIN_TITLE = "登录到系统 TCL BPC PRD"
@@ -37,6 +39,8 @@ class AoLogin:
         self.password = password
         self.client = client
         self.lang = lang
+        # ensure() 期间是否见过登录框：区分"密码错误/登录框卡住"与"从未弹框"
+        self.saw_login_box = False
 
     # ---------- 元素查找 ----------
 
@@ -78,7 +82,8 @@ class AoLogin:
         auto.SendKeys("{Delete}")
         time.sleep(0.1)
         if text:
-            auto.SendKeys(text)
+            # 密码可能含 + ^ % ~ ( ) { } —— 不转义会被 SendKeys 当控制字符
+            auto.SendKeys(escape_sendkeys(text))
         time.sleep(0.3)
 
     @staticmethod
@@ -170,6 +175,7 @@ class AoLogin:
 
                 if self._find_login(0.5):
                     saw_login = True
+                    self.saw_login_box = True
                     log.info("检测到 AO 登录框，开始自动登录")
                     self._fill_and_submit()
                     time.sleep(5)

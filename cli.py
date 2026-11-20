@@ -251,8 +251,7 @@ def cmd_apply(args) -> None:
 def cmd_switch_version(args) -> None:
     # 切版本要在导航表上操作，先把导航表打开（等价于双击进入 PBF），再连 COM
     flow_cfg = load_yaml(ROOT / "config" / "flow.yaml")
-    ensure_excel_ready(flow_cfg)
-    engine = ExcelEngine()
+    engine = ensure_excel_ready(flow_cfg)
     dims = load_dimensions()
     member_key = args.member_key
     display = dims["versions"].get(member_key, args.display_name or member_key)
@@ -512,8 +511,7 @@ def cmd_run_flow(args) -> None:
                         check_data=not (args.skip_fill or args.only_verify),
                         from_step=args.from_step or 1)
 
-    ensure_excel_ready(flow_cfg)
-    engine = ExcelEngine()
+    engine = ensure_excel_ready(flow_cfg)
 
     report = run_flow(engine, flow_cfg, form_cfgs, data_dir,
                       skip_fill=args.skip_fill, only_verify=args.only_verify,

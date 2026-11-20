@@ -282,17 +282,19 @@ def _open_ui(engine: ExcelEngine, flow_cfg: dict, connection: str, nav_title: st
     log.info("已点击『从 BW 平台打开工作簿』")
 
     # ④ 登录/连接/文档浏览的状态机：顺序不固定，有缓存会话时直接进文档浏览
-    login_t = None
+    login_handle = None
     target = None
     deadline = time.time() + max(wait_sec, 120)
     while time.time() < deadline:
-        if login_t is None and _login_visible():
+        if login_handle is None and _login_visible():
             log.info("检测到 AO 登录框，自动填写")
             from .bootstrap import _start_ao_login
-            login_t = _start_ao_login(flow_cfg)
-            if login_t is not None:
-                login_t.join(timeout=min(120.0, max(30.0, deadline - time.time())))
-                if login_t.is_alive():
+            login_handle = _start_ao_login(flow_cfg)
+            if login_handle is not None:
+                # 只在"线程等不出结果"时超时报错；登录失败（outcome=False）
+                # 说明登录框还在，交给循环重新检测并重试
+                login_handle.wait(timeout=min(120.0, max(30.0, deadline - time.time())))
+                if not login_handle.finished:
                     raise ExcelError("AO 自动登录超时，请检查账号密码后重试")
             continue
 
