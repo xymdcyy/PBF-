@@ -116,10 +116,12 @@ def apply_unit(flow_cfg: dict, units_cfg: dict, name: str) -> dict:
     return flow
 
 
-def check_units(units_cfg: dict, flow_cfg: dict) -> list[str]:
+def check_units(units_cfg: dict, flow_cfg: dict, only: str | None = None) -> list[str]:
     """离线校验业务单元配置，返回人类可读的问题列表（空列表 = 通过）。
 
     级别前缀：`错误:` 会阻止运行，`告警:` 仅提示。
+    `only` 指定单元名时只校验该单元——按 `--unit` 运行时，其他单元
+    （占位/未启用/缺品牌品类）的问题与本次运行无关，不应阻塞。
     """
     issues: list[str] = []
     brands = units_cfg.get("品牌") or []
@@ -129,10 +131,17 @@ def check_units(units_cfg: dict, flow_cfg: dict) -> list[str]:
     if not all_units:
         issues.append("错误: 未配置任何业务单元")
         return issues
-    if not enabled_unit_names(units_cfg):
-        issues.append("错误: 没有启用的业务单元（至少一个单元 启用: true）")
+    if only is not None:
+        if only not in all_units:
+            issues.append(f"错误: 未知业务单元 '{only}'，可选：{list(all_units)}")
+            return issues
+        targets = {only: all_units[only]}
+    else:
+        if not enabled_unit_names(units_cfg):
+            issues.append("错误: 没有启用的业务单元（至少一个单元 启用: true）")
+        targets = all_units
 
-    for name, unit in all_units.items():
+    for name, unit in targets.items():
         unit = unit or {}
         brand, category = str(unit.get("品牌", "")), str(unit.get("品类", ""))
         if not brand or not category:

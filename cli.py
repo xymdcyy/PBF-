@@ -40,7 +40,7 @@ import yaml
 from engine import (ExcelEngine, ExcelError, FormWriter, Navigator, RunPackageRunner,
                     FormReader, FormScanner, ensure_excel_ready, run_flow)
 from engine.business_units import (UnitError, apply_unit, check_units,
-                                   csv_dimension_warnings, enabled_unit_names)
+                                   csv_dimension_warnings, default_unit)
 from engine.clear import clear_data
 from engine.periods import parse_periods
 from engine.template_export import export_template
@@ -429,23 +429,29 @@ def cmd_run_flow(args) -> None:
     """按业务顺序跑完整 PBF 滚动预测流程。"""
     base_flow = load_yaml(ROOT / "config" / "flow.yaml")
     units_cfg = load_units_config()
-    unit_name = (getattr(args, "unit", None) or "").strip()
+    requested = (getattr(args, "unit", None) or "").strip()
+    # 与 webapp 的 _resolve_unit 统一：未指定 --unit 时默认第一个启用单元
+    unit_name = requested or default_unit(units_cfg) or ""
     if unit_name:
         try:
             flow_cfg = apply_unit(base_flow, units_cfg, unit_name)
         except UnitError as exc:
             raise SystemExit(f"业务单元配置错误: {exc}")
         unit = flow_cfg["_unit"]
-        print(f"业务单元: {unit_name}（{unit['brand']}·{unit['category']}）")
+        note = "" if requested else "（未指定 --unit，默认第一个启用单元）"
+        print(f"业务单元: {unit_name}（{unit['brand']}·{unit['category']}）{note}")
+    elif units_cfg.get("units"):
+        # 配置了单元却没有任何启用：拒绝静默跑 flow.yaml 写死行（与 webapp 行为一致）
+        raise SystemExit(
+            "业务单元配置错误: 没有启用的业务单元（至少一个单元 启用: true）；"
+            "如不需要按单元运行，请移除 config/business_units.yaml 的 units 配置")
     else:
         flow_cfg = base_flow
-        available = enabled_unit_names(units_cfg)
-        if available:
-            print(f"业务单元: 未指定 --unit，沿用 flow.yaml 的默认导航行"
-                  f"（可选：{', '.join(available)}）")
+        print("业务单元: 未配置业务单元，沿用 flow.yaml 的默认导航行")
     if units_cfg.get("units"):
-        for issue in check_units(units_cfg, base_flow):
-            if issue.startswith("错误:") and unit_name:
+        # 只校验本次要跑的单元，其余单元（占位/未启用）的问题不阻塞本次运行
+        for issue in check_units(units_cfg, base_flow, only=unit_name or None):
+            if issue.startswith("错误:"):
                 raise SystemExit(f"业务单元配置错误: {issue}")
             print(f"[业务单元] {issue}")
 

@@ -166,6 +166,43 @@ class TestCheckUnits(unittest.TestCase):
         self.assertTrue(any("未配置任何业务单元" in i for i in issues))
 
 
+class TestCheckUnitsOnly(unittest.TestCase):
+    """按 --unit 运行时只校验被选中的单元，其余单元的问题不阻塞。"""
+
+    def test_only_ignores_other_units(self):
+        units = _units()
+        # 未启用的占位单元缺品类：全量校验报错，only 校验不应报
+        units["units"]["TCL·电视"].pop("品类")
+        self.assertTrue(any("缺少 品牌/品类" in i
+                            for i in bu.check_units(units, _flow())))
+        self.assertEqual(bu.check_units(units, _flow(), only="乐华·电视"), [])
+
+    def test_only_reports_selected_unit_issues(self):
+        units = _units()
+        steps = units["units"]["乐华·电视"]["steps"]
+        steps[1]["nav_cell"] = steps[0]["nav_cell"]
+        issues = bu.check_units(units, _flow(), only="乐华·电视")
+        self.assertTrue(any("nav_cell 重复" in i for i in issues))
+
+    def test_only_reports_selected_unit_missing_dims(self):
+        units = _units()
+        units["units"]["乐华·电视"].pop("品类")
+        issues = bu.check_units(units, _flow(), only="乐华·电视")
+        self.assertTrue(any("缺少 品牌/品类" in i for i in issues))
+
+    def test_only_unknown_unit(self):
+        issues = bu.check_units(_units(), _flow(), only="雷鸟·电视")
+        self.assertTrue(any("未知业务单元" in i for i in issues))
+
+    def test_only_skips_global_no_enabled_check(self):
+        # only 指定的单元本身是启用的，全局“没有启用单元”检查不参与
+        units = _units()
+        for name, u in units["units"].items():
+            if name != "乐华·电视":
+                u["启用"] = False
+        self.assertEqual(bu.check_units(units, _flow(), only="乐华·电视"), [])
+
+
 class TestCsvDimensionWarnings(unittest.TestCase):
     def _write(self, directory: Path, name: str, text: str) -> None:
         (directory / name).write_text(text, encoding="utf-8-sig")
