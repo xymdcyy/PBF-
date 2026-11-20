@@ -26,7 +26,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # 测试只覆盖纯逻辑模块（期间解析、配置校验、运行注册表等），
-      # engine/__init__.py 按需导入，因此这里不安装 pywin32/Office 依赖。
+      # 测试本身不连 Excel/AO（pywin32 相关由 tests/_stubs.py 打桩），
+      # 但 test_clear 依赖 pandas、test_template_export 依赖 openpyxl，
+      # 直接按 requirements.txt 装全量运行依赖，保证 CI 与真实运行环境一致。
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
