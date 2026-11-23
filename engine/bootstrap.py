@@ -17,9 +17,33 @@ from .excel import ExcelEngine, ExcelError, reset_active_excel
 
 log = logging.getLogger(__name__)
 
-# 复用已打开的 Excel 时守候登录框的时长。AO 加载约 10s 后才弹登录框；
-# 已用缓存凭据登录时框不会出现，等满 60s 会让每次复用都空等一分钟。
+# 复用已打开的 Excel 时守候登录框的默认时长（可用 flow.yaml 的
+# login.reuse_wait_sec 覆盖）。AO 加载约 10s 后才弹登录框；已用缓存凭据
+# 登录时框不会出现，等满 60s 会让每次复用都空等一分钟，故默认只等 15s。
 REUSE_LOGIN_WAIT_SEC = 15
+
+
+def _reuse_login_wait_sec(flow_cfg: dict) -> float:
+    """复用 Excel 时守候登录框的秒数：flow.yaml login.reuse_wait_sec，默认 15。
+
+    配置非法（非数字 / ≤0）时告警并回退默认值——守候时长只影响"等多久
+    才认定没有登录框"，一个笔误不该悄悄改变行为，更不该让流程起不来。
+    """
+    login_cfg = flow_cfg.get("login")
+    raw = login_cfg.get("reuse_wait_sec") if isinstance(login_cfg, dict) else None
+    if raw is None:
+        return REUSE_LOGIN_WAIT_SEC
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        log.warning("login.reuse_wait_sec=%r 不是数字，回退默认 %ss",
+                    raw, REUSE_LOGIN_WAIT_SEC)
+        return REUSE_LOGIN_WAIT_SEC
+    if val <= 0:
+        log.warning("login.reuse_wait_sec=%s ≤ 0 无意义，回退默认 %ss",
+                    raw, REUSE_LOGIN_WAIT_SEC)
+        return REUSE_LOGIN_WAIT_SEC
+    return val
 
 
 def excel_pids() -> list[int]:
@@ -126,6 +150,14 @@ def _start_ao_login(flow_cfg: dict, expect_login: bool = True,
                 handle.saw_box = ao.saw_login_box
                 if not ok and not quiet:
                     log.warning("后台自动登录未成功（超时或密码错误），请检查账号密码")
+                elif not ok and quiet and not handle.saw_box:
+                    # quiet 只用于"复用 Excel 守候登录框"场景：没等到框多数是
+                    # 已登录（正常），但也可能是 AO 加载慢、守候超时后框才弹。
+                    # 打一条明确日志，事后好定位"卡死在登录框"是不是等短了。
+                    log.info(
+                        "复用 Excel：%.0fs 内未检测到 AO 登录框（已登录时属正常）；"
+                        "若随后的操作卡死在登录框，请在 flow.yaml 调大 "
+                        "login.reuse_wait_sec（当前 %.0fs）", wait, wait)
             except Exception as exc:
                 handle.outcome = False
                 handle.error = str(exc)
@@ -176,10 +208,10 @@ def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False,
             # 起一个后台线程守候登录框（没出现就按超时自行退出），
             # 这样随后卡在模态登录框上的导航表/刷新调用会被自动解锁。
             # 结果句柄交给 run_flow 等 outcome，不能把"线程已启动"当登录成功。
-            # 超时只给 REUSE_LOGIN_WAIT_SEC：登录框 10s 左右就会弹，
-            # 已登录时不会弹，等满 60s 纯属空等。
+            # 超时默认只给 15s：登录框 10s 左右就会弹，已登录时不会弹，
+            # 等满 60s 纯属空等；可用 flow.yaml login.reuse_wait_sec 调整。
             handle = _start_ao_login(flow_cfg, quiet=True,
-                                     timeout=REUSE_LOGIN_WAIT_SEC)
+                                     timeout=_reuse_login_wait_sec(flow_cfg))
             return _mark_login(engine, launched_now=False, login_handle=handle)
         except ExcelError:
             pass
