@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import re
 import shutil
 import tempfile
@@ -20,6 +21,8 @@ from uuid import uuid4
 from openpyxl import load_workbook
 
 from .periods import parse_periods, period_index
+
+log = logging.getLogger(__name__)
 
 
 class EmptyExportError(ValueError):
@@ -95,6 +98,10 @@ def _replace_dir(staging: Path, out_dir: Path) -> None:
         raise
     if backup is not None:
         shutil.rmtree(backup, ignore_errors=True)
+        if backup.exists():
+            # Windows 偶发目录被占用（WinError 5）删不掉：留个明确痕迹便于排查，
+            # 残留的 .data_xxx.bak-xxxx 不影响下次导出，但不该无声消失
+            log.warning("上一轮数据备份目录未能删除（可能被进程占用）：%s", backup)
 
 
 def _dump(out_dir: Path, name: str, rows: list[dict], fieldnames: list[str]) -> int:
