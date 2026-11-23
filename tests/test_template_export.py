@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _stubs  # noqa: F401
@@ -118,6 +119,40 @@ class ExportTests(unittest.TestCase):
         leftovers = [p.name for p in self.out.parent.iterdir()
                      if p.name.startswith(f".{self.out.name}.")]
         self.assertEqual(leftovers, [])
+
+    @staticmethod
+    def _win_error_5() -> PermissionError:
+        """构造带 winerror=5 的 PermissionError（模拟 Windows 瞬态占用）。"""
+        exc = PermissionError(5, "拒绝访问")
+        exc.winerror = 5
+        return exc
+
+    def test_transient_rename_failure_is_retried(self) -> None:
+        # Windows 偶发 WinError 5：第一次目录改名失败后短重试应恢复，导出成功
+        self._write_stale()
+        real_rename = Path.rename
+        calls = {"n": 0}
+
+        def flaky(self, target, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ExportTests._win_error_5()
+            return real_rename(self, target, **kw)
+
+        with mock.patch("pathlib.Path.rename", flaky):
+            rows = export_template(self.template, ["2027.01"], self.out)
+        self.assertEqual(rows["价格销量CT.csv"], 1)
+
+    def test_persistent_rename_failure_raises_and_keeps_stale(self) -> None:
+        # rename 重试耗尽仍失败：异常向上抛，上一轮 CSV 不被清掉
+        self._write_stale()
+
+        def always_fail(self, target, **kw):
+            raise ExportTests._win_error_5()
+
+        with mock.patch("pathlib.Path.rename", always_fail):
+            with self.assertRaises(PermissionError):
+                export_template(self.template, ["2027.01"], self.out)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ import logging
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -79,6 +80,27 @@ EXPORT_FILES = (
 )
 
 
+# Windows 上目录 rename 偶发瞬态占用：WinError 5（拒绝访问）/ 32（共享冲突）/
+# 33（锁定）——杀软或索引服务正扫描刚写入的目录、旧条目尚未释放。实测连跑
+# 10 次能碰上几次，短重试即可恢复，不值得让整个导出失败。
+_TRANSIENT_WINERRORS = (5, 32, 33)
+
+
+def _rename_dir(src: Path, dst: Path, attempts: int = 5, delay: float = 0.08) -> None:
+    """目录改名；仅对 Windows 瞬态占用（WinError 5/32/33）做有界重试。"""
+    for attempt in range(1, attempts + 1):
+        try:
+            src.rename(dst)
+            return
+        except OSError as exc:
+            transient = getattr(exc, "winerror", None) in _TRANSIENT_WINERRORS
+            if not transient or attempt == attempts:
+                raise
+            log.warning("目录改名失败（Windows 瞬态占用，%.0fms 后重试 %d/%d）：%s",
+                        delay * 1000, attempt, attempts - 1, exc)
+            time.sleep(delay)
+
+
 def _replace_dir(staging: Path, out_dir: Path) -> None:
     """用同盘的 staging 目录整体替换 out_dir（失败时恢复旧目录）。
 
@@ -89,12 +111,12 @@ def _replace_dir(staging: Path, out_dir: Path) -> None:
     backup: Path | None = None
     if out_dir.exists():
         backup = out_dir.with_name(f".{out_dir.name}.bak-{uuid4().hex[:8]}")
-        out_dir.rename(backup)
+        _rename_dir(out_dir, backup)
     try:
-        staging.rename(out_dir)
+        _rename_dir(staging, out_dir)
     except Exception:
         if backup is not None and not out_dir.exists():
-            backup.rename(out_dir)
+            _rename_dir(backup, out_dir)
         raise
     if backup is not None:
         shutil.rmtree(backup, ignore_errors=True)
