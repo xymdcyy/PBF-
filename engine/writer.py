@@ -584,12 +584,35 @@ class FormWriter:
                 if header == key or header.startswith(key) or key.startswith(header):
                     mapping[measure] = cols
                     break
+        # 识别失败/不完整绝不静默回退配置列：配置列是按模板实测写死的，
+        # 模板块宽度随版本期间窗口变（6 列 ↔ 7 列），识别失败往往意味着
+        # 模板和配置对不上，硬写配置列会把数字写进错误的度量/期间。
         if not mapping:
-            return None
+            raise ExcelError(
+                f"度量块表头识别失败：{name_row}/{header_row} 行没有找到"
+                "「度量名 + YYYY.MM 期间」表头（配置的 measures 一个都对不上）。"
+                "可能是表单尚未加载完成，或 header_row/measure_name_row 配置有误；"
+                "为避免按旧列号写错列，本次中止。请重新打开表单后重试，"
+                "或核对表单配置")
         missing = [m for m in config_measures if m not in mapping]
         if missing:
-            log.warning(f"度量表头识别不完整，缺少 {missing}，回退配置列")
-            return None
+            raise ExcelError(
+                f"度量块表头识别不完整：缺少 {missing} 的表头。模板度量块与配置的 "
+                "measures 对不上，为避免静默写错列，本次中止。请核对表单配置")
+        sizes = {m: len(cols) for m, cols in mapping.items()}
+        if len(set(sizes.values())) > 1:
+            raise ExcelError(
+                f"度量块表头识别异常：各度量的期间数不一致（{sizes}），"
+                "表头可能有合并单元格或空列。为避免写错列，本次中止。请核对表头")
+        owners: dict[str, str] = {}
+        for m, cols in mapping.items():
+            for period, col in cols.items():
+                if col in owners and owners[col] != m:
+                    raise ExcelError(
+                        f"度量块表头识别异常：列 {col} 同时识别给 "
+                        f"{owners[col]} 和 {m}，表头可能有重复期间。"
+                        "为避免写错列，本次中止。请核对表头")
+                owners[col] = m
         log.info("度量块表头识别: " + "；".join(
             f"{m}={sorted(cols)}" for m, cols in mapping.items()))
         return mapping
@@ -598,7 +621,8 @@ class FormWriter:
         """度量块布局：一行 = 一个维度组合 + 一个期间 + 多个度量值。
 
         期间取数据行的 `period_field`（默认"期间"）列，定位到该度量对应的列。
-        列映射优先按表头动态识别（见 `_detect_measure_columns`），识别不了才用配置。
+        列映射按表头动态识别（见 `_detect_measure_columns`）；识别失败/不完整
+        会直接报错而不是回退配置列——模板块宽会变，硬写配置列可能写错列。
         """
         if self._measure_map is None:
             self._measure_map = self._detect_measure_columns(sheet)
@@ -735,10 +759,13 @@ class FormWriter:
             source = self._measure_map or (self.cfg.get("measures") or {})
             data_cols = [next(iter(cols.values())) for cols in source.values() if cols]
         elif layout == "matrix":
-            data_cols = list((self.cfg.get("period_blocks") or {}).values())[:1]
+            data_cols = list((self.cfg.get("period_blocks") or {}).values())
         else:
-            data_cols = list((self.cfg.get("month_columns") or {}).values())[:2]
-        cols = list(dict.fromkeys((key_cols[:2] + data_cols[:2])))
+            data_cols = list((self.cfg.get("month_columns") or {}).values())
+        # 查询态下各数据列底色不一（价格表：单价白底、销量/CT 蓝底），只抽
+        # 前两列会把可编辑误判成锁定；抽全数据列（封顶 8 个）才能区分，
+        # 真锁定时整片蓝，多抽几个不影响判定。
+        cols = list(dict.fromkeys((key_cols[:2] + data_cols)))[:8]
         if not cols:
             return False
         samples = [f"{c}{r}" for r in range(start, min(start + 4, end + 1)) for c in cols]

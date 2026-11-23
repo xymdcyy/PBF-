@@ -120,6 +120,21 @@ class SessionExpiredError(ExcelError):
     """
 
 
+# AO 宏（Execute/Refresh_Status）在会话过期时统一抛的特征码
+_SESSION_EXPIRED_MARKERS = ("0x800A9C68", "-2146788248")
+
+
+def is_session_expired(exc: BaseException) -> bool:
+    """错误文本里是否带 AO/BPC 会话失效的特征码。
+
+    只认 0x800A9C68 / -2146788248，不认「发生意外」/ -2147352567——那俩是
+    通用 DISP_E_EXCEPTION 包装，版本与期间不匹配等普通错误也长这样，
+    拿它们触发强制重启会误杀正常会话。
+    """
+    text = str(exc or "")
+    return any(marker in text for marker in _SESSION_EXPIRED_MARKERS)
+
+
 class PbfFlow:
     def __init__(self, engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Path,
                  persist_panel_cache: bool = False) -> None:
@@ -331,7 +346,7 @@ class PbfFlow:
             # "发生意外"（0x80020009 / 内层 0x800A9C68）几乎都来自 AO/BPC 服务端：
             # 会话过期，或版本与目标期间不匹配。给一句能直接下手的人话。
             if ("发生意外" in text or "-2147352567" in text
-                    or "-2146788248" in text or "0x800A9C68" in text):
+                    or is_session_expired(exc)):
                 raise SessionExpiredError(
                     "刷新流程（Refresh_Status）失败：AO/BPC 会话可能已过期，或版本与目标期间不匹配。"
                     "请手动打开 Excel 的 Analysis 选项卡确认已连接 BPC 并重新登录；"
@@ -515,12 +530,23 @@ class PbfFlow:
             pass
         self.engine._retry(lambda: ws.Range(nav_cell).Select(), attempts=5, delay=2)
 
+    def _row_type(self, ws, btn: str) -> str:
+        """按钮所在行对应的「行类型」列（AR 列）值：表单 / 运行包。"""
+        row = "".join(ch for ch in btn if ch.isdigit())
+        return str(self._read(ws, f"AR{row}") or "").strip() if row else ""
+
     def _wait_panel_refresh(self, ws, nav_cell: str, btn: str,
-                            before: str, timeout_sec: float) -> tuple[bool, str, bool]:
+                            before: str, timeout_sec: float,
+                            want: Optional[str] = None,
+                            accept_static: bool = False) -> tuple[bool, str, bool]:
         """等面板刷新出"打开"按钮；返回 (是否刷新, 按钮当前文案, 是否命中缓存)。
 
         命中缓存（面板内容 == 该行上次验证过的正确指纹）也算刷新成功：
         上一次运行可能刚好把面板停在这一行，选中前后内容一致属正常。
+
+        accept_static：无缓存时（新进程冷启动），刷新流程已成功过一轮之后，
+        面板内容没变也可接受——前提是按钮行的行类型与 want 一致。不然会把
+        "面板本来就停在目标行"误判成会话失效，白重启一次 Excel。
         """
         deadline = time.time() + max(float(timeout_sec), 1.0)
         cached = self._panel_cache.get(self._panel_cache_key(nav_cell))
@@ -530,6 +556,7 @@ class PbfFlow:
             try:
                 now = self._panel_fingerprint()
                 btn_text = str(self._read(ws, btn) or "").strip()
+                row_type = self._row_type(ws, btn)
             except ExcelError as exc:
                 log.warning(f"等待 {nav_cell} 面板时读取失败（继续等）: {exc}")
                 continue
@@ -537,6 +564,8 @@ class PbfFlow:
                 if now != before:
                     return True, btn_text, False
                 if cached is not None and now == cached:
+                    return True, btn_text, True
+                if accept_static and want and row_type == want:
                     return True, btn_text, True
         return False, btn_text, False
 
@@ -554,6 +583,7 @@ class PbfFlow:
         panel_wait = float(self.nav_cfg.get("panel_wait_sec") or 15)
 
         # "打开"靠导航表的 SelectionChange 触发，偶尔会被 Excel/AO 忙吞掉，因此重试几轮
+        want = {"form": "表单", "package": "运行包"}.get(expect)
         last_names: list[str] = []
         via_cache = False
         for attempt in range(1, 4):
@@ -562,8 +592,11 @@ class PbfFlow:
                 lambda: self.engine.workbook_names(), attempts=5, delay=2))
             before_panel = self._panel_fingerprint()
             self._select_nav_cell(ws, nav_cell)
+            # 第 1 轮不允许"面板没动就算刷新过"——那可能真是会话死了，
+            # 交给下面的刷新流程去分辨；刷新成功过一轮后才接受静止面板。
             fresh, btn_text, via_cache = self._wait_panel_refresh(
-                ws, nav_cell, btn, before_panel, panel_wait)
+                ws, nav_cell, btn, before_panel, panel_wait,
+                want=want, accept_static=attempt > 1)
 
             if not fresh:
                 log.warning(
@@ -589,9 +622,7 @@ class PbfFlow:
                     f"{nav_cell} 的步骤面板已刷新，但 {btn} 不是「打开」（实际 '{btn_text}'）。"
                     f"请检查该步骤的行号配置（当前 {btn}）与面板内容。")
 
-            row = "".join(ch for ch in btn if ch.isdigit())
-            row_type = str(self._read(ws, f"AR{row}") or "").strip() if row else ""
-            want = {"form": "表单", "package": "运行包"}.get(expect)
+            row_type = self._row_type(ws, btn)
             if want and row_type and row_type != want:
                 names = []
                 for r in range(50, 66):
@@ -1125,7 +1156,10 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
             except Exception as exc:            # 包含未包装的 com_error
                 del report["steps"][steps_len:]      # 丢掉这次重试前的半成品记录
                 del report["packages"][pkgs_len:]
-                session_expired = isinstance(exc, SessionExpiredError)
+                # 会话失效有两个来源：已翻译成 SessionExpiredError 的，和
+                # trigger_calc/run_package 里宏直接把 0x800A9C68 抛上来的
+                # （不走 refresh_flow 的翻译，这里按文本特征兜底识别）。
+                session_expired = isinstance(exc, SessionExpiredError) or is_session_expired(exc)
                 if attempt >= attempts or not (is_disconnect(exc) or session_expired):
                     raise
                 reason = "AO 会话失效" if session_expired else "Excel 断开"
@@ -1242,7 +1276,8 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
                 "form": exc.form_id, "label": exc.label,
                 "user": exc.user, "message": str(exc),
             }
-            report["stopped"] = "locked"
+            # 是否因锁定中止，看 report["locked"] 是否存在即可（CLI 消费它），
+            # 不再另设 report["stopped"] 冗余标记
             log.error(str(exc))
             return report
 

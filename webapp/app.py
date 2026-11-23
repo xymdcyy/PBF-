@@ -305,6 +305,12 @@ def _spawn(params: dict) -> str | None:
                            "--run", "--report-file", str(report_path)]
                     if unit:
                         cmd += ["--unit", unit]
+                    # 清 0 的 run-flow 同样要做版本核对/逐表一致，别让 fill
+                    # 分支专享——不然清 0 跑出的表单可能停在别的版本上
+                    if version_display:
+                        cmd += ["--version", version_display]
+                    if version_key:
+                        cmd += ["--version-key", version_key]
                 else:
                     lf.write("[Web] 开始执行全流程（run-flow）…\n")
                     lf.flush()

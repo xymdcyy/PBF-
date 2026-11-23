@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _stubs  # noqa: F401
 
 from engine.excel import ExcelError
-from engine.orchestrator import PbfFlow, SessionExpiredError
+from engine.orchestrator import PbfFlow, SessionExpiredError, is_session_expired
 
 
 class FakeRange:
@@ -230,7 +230,6 @@ class PanelCacheTests(unittest.TestCase):
         现场 2026-11-23：清 0 续跑时面板恰好停在 AC70，选中前后内容一致，
         被误判为"面板未刷新"而强制重启 Excel——本次修复要杜绝这种误判。
         """
-        # 先得到 AC62 正确面板的指纹（模拟上次运行留下的状态）
         flow1, _, sheet1 = make_flow()
         flow1.engine.select(sheet1, "AC62")
         fingerprint = flow1._panel_fingerprint()
@@ -242,6 +241,31 @@ class PanelCacheTests(unittest.TestCase):
 
         name = flow2.open_via_nav("AC62", expect="package")
         self.assertIn("运行包", name)
+
+    def test_panel_already_on_target_without_cache_accepted_by_row_type(self) -> None:
+        """冷启动（无缓存）+ 面板停在目标行：刷新成功过一轮后应按行类型放行。
+
+        原缺陷：新进程没有持久化缓存，面板恰好停在目标行、内容不再变化，
+        第 2 轮重试会把"没变化"判成会话失效，白重启一次 Excel 并重新登录。
+        现在第 1 轮仍交给刷新流程分辨，刷新成功过（会话活着）之后，
+        按钮行行类型与期望一致就接受静止面板。
+        """
+        flow, _, sheet = make_flow(refresh_on_select=False)
+        # 面板本来就停在 AC62 的正确内容上，且没有持久化缓存
+        sheet.panel = {r: list(v) for r, v in sheet.panels["AC62"].items()}
+
+        name = flow.open_via_nav("AC62", open_cell="AT52", expect="package")
+        self.assertIn("运行包", name)
+        # 静止面板被采用后也应落库，下次可直接命中缓存
+        self.assertIn(flow._panel_cache_key("AC62"), flow._panel_cache)
+
+    def test_stale_static_panel_with_wrong_row_type_still_rejected(self) -> None:
+        """静止面板若停在别的行上，行类型对不上仍要拦下，不能被静态放行绕过。"""
+        flow, _, sheet = make_flow(refresh_on_select=False)
+        # 面板停在 AC70 的内容：AT52 行类型是「表单」，与期望的「运行包」不符
+        sheet.panel = {r: list(v) for r, v in sheet.panels["AC70"].items()}
+        with self.assertRaises(SessionExpiredError):
+            flow.open_via_nav("AC62", open_cell="AT52", expect="package")
 
     def test_cached_panel_click_no_response_raises_session_expired(self) -> None:
         """面板是"已知正确内容"但点击毫无反应：会话大概率已死，必须走恢复。
@@ -281,6 +305,37 @@ class PanelCacheTests(unittest.TestCase):
             flow2._panel_cache_file = cache_file
             flow2._load_panel_cache()
             self.assertEqual(flow2._panel_cache.get(key), data[key])
+
+
+class SessionExpiredDetectionTests(unittest.TestCase):
+    """is_session_expired：按文本特征码识别宏里直接抛出的会话失效。
+
+    run_with_recovery 只对 SessionExpiredError 和「Excel 断开」做恢复；
+    trigger_calc/run_package 的宏不走 refresh_flow 的翻译，0x800A9C68
+    会裸抛上来——恢复前必须先把这类错误认出来。
+    """
+
+    def test_macro_session_codes_are_detected(self) -> None:
+        self.assertTrue(is_session_expired(ExcelError(
+            "macro 'x'!Execute: (-2147352567, '发生意外。', "
+            "(0, None, None, None, 0, -2146788248), None)")))
+        self.assertTrue(is_session_expired(Exception("0x800A9C68")))
+        self.assertTrue(is_session_expired(
+            SessionExpiredError("面板未刷新 (0x800A9C68)")))
+
+    def test_generic_wrapper_codes_are_not_detected(self) -> None:
+        # 「发生意外」/-2147352567 是通用 DISP_E_EXCEPTION 包装：
+        # 版本与期间不匹配等普通错误也长这样，不能据此强制重启 Excel
+        self.assertFalse(is_session_expired(ExcelError("发生意外。")))
+        self.assertFalse(is_session_expired(ExcelError(
+            "(-2147352567, '发生意外。', (0, None, None, None, 0, -2147352567), None)")))
+        self.assertFalse(is_session_expired(ExcelError("未打开新工作簿")))
+        self.assertFalse(is_session_expired(None))
+
+    def test_session_expired_error_instance_without_code(self) -> None:
+        # 纯文本的 SessionExpiredError 靠 run_with_recovery 的 isinstance
+        # 分支识别，is_session_expired 只管文本特征——两者是互补关系
+        self.assertFalse(is_session_expired(SessionExpiredError("面板一直没有刷新")))
 
 
 if __name__ == "__main__":
