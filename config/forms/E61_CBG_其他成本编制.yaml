@@ -2,6 +2,7 @@
 # 结构: simple — 单科目(末级) × 期间矩阵
 # 2026-11-11 live 扫描确认: header_row=57, 科目列 AC(末级), 期间 AF..AV
 form_id: E61_CBG_其他成本编制
+label: "其他成本"
 workbook_pattern: "YCCBW028_其他成本编制表_CBG*"
 sheet: "CBG其他成本编制表"
 layout: simple
@@ -18,7 +19,10 @@ mode_switch:
   force_set: false
 
 # 版本区 — F4 是显示文本；E4/G4 是成员键 (如 C03202611V1)
-version_cell: "F4"
+version_cell: "F4"             # 预算版本显示文本
+version_key_cell: "E4"         # 目标版本成员键（切版本写这里）
+version_current_cell: "G4"     # SAP 当前变量值
+version_match_cell: "H4"       # Y=目标与当前一致
 
 # 行匹配 — AC=末级科目名(唯一)，AA/AB 仅作兜底
 item_column: "AC"

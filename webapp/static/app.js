@@ -242,7 +242,15 @@ function pollLog(offset) {
 
 async function loadResult() {
   const r = await getJSON(`/api/run/${currentRunId}/result`);
-  if (!r.ok || !r.report || !r.report.indicators) {
+  if (!r.ok || !r.report) {
+    $("result").textContent = "（无损益核对结果）";
+    return;
+  }
+  if (r.report.locked) {
+    $("result").textContent = r.report.locked.message || "表单被锁定，流程已中止";
+    return;
+  }
+  if (!r.report.indicators) {
     $("result").textContent = "（无损益核对结果）";
     return;
   }

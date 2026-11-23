@@ -510,7 +510,8 @@ def cmd_clear(args) -> None:
             data_dir=str(out_dir), skip_fill=False, only_verify=False,
             from_step=None, version=None, preflight_only=False,
             version_key=None, unit=getattr(args, "unit", None),
-            report_file=getattr(args, "report_file", None))
+            report_file=getattr(args, "report_file", None),
+            clear_mode=True)   # 清 0 后损益指标全 0 属预期，核对放行
         cmd_run_flow(rf_args)
 
 
@@ -573,6 +574,17 @@ def cmd_units(args) -> None:
     print(f"\n校验: {'通过' if not issues else f'{len(issues)} 项问题'}")
     for issue in issues:
         print(f"  {issue}")
+
+
+def write_report_file(args, report: dict) -> None:
+    """把 report 写成 JSON（--report-file），预检/正式运行两条路径共用。"""
+    rp = getattr(args, "report_file", None)
+    if not rp:
+        return
+    path = Path(rp)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, default=str)
 
 
 def cmd_run_flow(args) -> None:
@@ -640,7 +652,8 @@ def cmd_run_flow(args) -> None:
                       expected_version=args.version,
                       from_step=from_step if raw_from_step else None,
                       preflight_only=preflight_only,
-                      switch_version_key=getattr(args, "version_key", None))
+                      switch_version_key=getattr(args, "version_key", None),
+                      clear_mode=bool(getattr(args, "clear_mode", False)))
     if unit_name:
         report["unit"] = unit_name
 
@@ -663,10 +676,10 @@ def cmd_run_flow(args) -> None:
                 print(f"      … 另有 {len(p['skipped']) - 5} 项未匹配")
         all_ok = all(p["ok"] for p in report["preflights"])
         print(f"\n预检结果: {'全部通过' if all_ok else '存在失败项，请先修正再正式运行'}")
-        if not all_ok:
-            audit_log("run-flow", report)
-            sys.exit(1)
         audit_log("run-flow", report)
+        write_report_file(args, report)
+        if not all_ok:
+            sys.exit(1)
         return
 
     if report["steps"]:
@@ -707,15 +720,20 @@ def cmd_run_flow(args) -> None:
                 v = vals.get(p)
                 row += ("" if v is None else f"{v:,.4f}".rstrip("0").rstrip(".")).rjust(20)
             print(row)
+        if report.get("indicators_all_zero"):
+            print("  （目标期间指标全 0：清 0 模式，属预期结果）")
+
+    if report.get("locked"):
+        print(f"\n[流程中止] {report['locked']['message']}")
 
     audit_log("run-flow", report)
 
-    # 供 Web 界面读取结构化结果（version/steps/packages/indicators）
-    if getattr(args, "report_file", None):
-        rp = Path(args.report_file)
-        rp.parent.mkdir(parents=True, exist_ok=True)
-        with open(rp, "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, default=str)
+    # 供 Web 界面读取结构化结果（version/steps/packages/indicators/locked）
+    write_report_file(args, report)
+
+    if report.get("locked"):
+        print("\n已按业务规则跳过该表单并结束流程。")
+        sys.exit(2)
 
     print("\n完成。")
 
@@ -795,6 +813,8 @@ def build_parser() -> argparse.ArgumentParser:
     rf.add_argument("--preflight-only", action="store_true",
                     help="干跑：只打开各表单做行匹配/期间覆盖预检，不写入任何数据")
     rf.add_argument("--report-file", help="把最终 report 写成 JSON 到指定路径（供 Web 界面读取）")
+    rf.add_argument("--clear-mode", action="store_true",
+                    help="清 0 流程：目标期间损益指标全 0 属预期，核对只告警不报错")
     rf.add_argument("--unit",
                     help="业务单元（品牌×品类），如 乐华·电视；覆盖 flow.yaml 的 nav_cell")
 

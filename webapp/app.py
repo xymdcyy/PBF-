@@ -313,6 +313,9 @@ def _spawn(params: dict) -> str | None:
                         cmd += ["--unit", unit]
                     if version_display:
                         cmd += ["--version", version_display]
+                    if version_key:
+                        # 逐表核对/切换版本需要成员键（导航表切过一次也再传，确保表单层一致）
+                        cmd += ["--version-key", version_key]
                     cmd += ["--report-file", str(report_path)]
                 state["exit_code"] = _run_step(cmd, lf, state)
         except Exception as exc:

@@ -1,11 +1,19 @@
 # Dimensions — reusable across all forms.
-# Version member keys follow pattern: C03 + YYYYMM + V1
+# Version member keys follow pattern: C03 + YYYYMM + Vn
+#   V1 = 月初版（每月 5 号左右编制）
+#   V2 = 财总版（每月 20 号以后编制；AO 显示为"财总版"，口语也叫"财总会版"）
+# 显示文本必须与导航表 AR45 完全一致，切版本时据此校验。
 versions:
   C03202609V1: "滚动预测2026年9月月初版"
+  C03202609V2: "滚动预测2026年9月财总版"
   C03202610V1: "滚动预测2026年10月月初版"
+  C03202610V2: "滚动预测2026年10月财总版"
   C03202611V1: "滚动预测2026年11月月初版"
+  C03202611V2: "滚动预测2026年11月财总版"   # 已现场核实 2026-11-19（AR45/C20）
   C03202612V1: "滚动预测2026年12月月初版"
+  C03202612V2: "滚动预测2026年12月财总版"
   C03202701V1: "滚动预测2027年1月月初版"
+  C03202701V2: "滚动预测2027年1月财总版"
 
 # Config for the PBF Pro navigator workbook
 navigator:

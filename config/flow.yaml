@@ -45,6 +45,10 @@ navigator:
   refresh_flow_macro: "Refresh_Status"  # "刷新流程"按钮 Button 9
   open_button_cell: "AT52"             # 选中业务单元行后，AT52 变为"打开"
   open_wait_sec: 14
+  # 右侧「步骤事项」面板（AP=名称 AQ=ID AR=类型 AS=说明 AT=执行/打开）。
+  # 选中业务单元后面板必须刷新；不刷新说明 AO 会话已失效，不能直接点 AT52。
+  panel_range: "AP48:AU60"
+  panel_wait_sec: 15
 
 # ---------- 运行包执行清单 ----------
 package:

@@ -3,6 +3,7 @@
 # 2026-11-11 live 扫描确认: header_row=54(期间) / 55(区域代码) / 56(区域名), 科目列 AA, 数据 57..71
 # 每个期间块 7 列，块内区域顺序固定（见 region_order）
 form_id: HQ_毛上调整
+label: "HQ渠道毛上调整"
 workbook_pattern: "YCSRW028_除泛智屏_HQ渠道毛上调整表*"
 sheet: "YC_除泛智屏_HQ渠道毛上调整表"
 layout: matrix
@@ -18,7 +19,10 @@ mode_switch:
   macro: "Switch_mode"
   force_set: false
 
-version_cell: "F4"
+version_cell: "F4"             # 预算版本显示文本
+version_key_cell: "E4"         # 目标版本成员键（切版本写这里）
+version_current_cell: "G4"     # SAP 当前变量值
+version_match_cell: "H4"       # Y=目标与当前一致
 
 # 行匹配 — AA 列科目名
 item_column: "AA"

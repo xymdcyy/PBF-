@@ -192,8 +192,12 @@ def _mark_login(engine: ExcelEngine, launched_now: bool, login_done: bool = Fals
 
 
 def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False,
-                       stale_pid: int | None = None, wait_sec: int = 180):
+                       stale_pid: int | None = None, wait_sec: int = 180,
+                       force_restart: bool = False):
     """确保真实 Excel 已运行且导航表已打开，否则自动打开。
+
+    force_restart=True：AO 会话失效时进程和导航表都还在，复用旧实例无法
+    重建会话，必须先结束本流程自己的 Excel 再重启。
 
     返回可复用的 ExcelEngine（所有成功路径），调用方可复用同一实例，避免重连到别的 Excel。
     打开导航表用真实 Excel 的 EXE 以文档参数启动（等价于双击文件），完整加载 AO 并连接
@@ -202,6 +206,25 @@ def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False,
     nav = flow_cfg.get("navigator") or {}
     pattern = nav.get("workbook_pattern", "PBF Pro - 全面预算系统流程导航*")
     path = Path(nav["launch_file"]) if nav.get("launch_file") else None
+
+    # 0) 会话失效：强制结束本流程的 Excel。只认 stale_pid，绝不无差别杀进程。
+    if force_restart:
+        running = excel_pids()
+        if stale_pid and stale_pid in running:
+            # 先把导航表标记为已保存，避免 taskkill 后 Excel 下次启动弹恢复副本
+            try:
+                engine = ExcelEngine(timeout_sec=3)
+                for wb in engine._excel.Workbooks:
+                    if "导航" in wb.Name:
+                        wb.Saved = True
+            except Exception:
+                pass
+            log.warning(f"AO 会话失效，结束旧 Excel PID={stale_pid} 以重建会话…")
+            kill_excel(stale_pid)
+        elif running:
+            log.warning(
+                f"AO 会话失效，但未能定位旧 Excel PID（目标 PID={stale_pid}）；"
+                "为避免影响其它 Excel 不强制结束，恢复可能失败，请手动关闭该 Excel")
 
     # 1) 已经就绪（真实 Excel 里导航表已打开）——仅当确有 Excel 进程时才去连，
     #    否则 ExcelEngine 的 Dispatch 会拉起一个空 Excel，还得再关掉，反而制造竞态。

@@ -2,6 +2,7 @@
 # 结构: keyed — (渠道 + 科目) 组合键 × 期间矩阵
 # 2026-11-11 live 扫描确认: header_row=56, AA=渠道, AB=科目, 期间 AC..AR
 form_id: E61_CBG_客户费用编制
+label: "客户费用"
 workbook_pattern: "YCSRW017_客户费用编制表_CBG专用*"
 sheet: "客户费用编制表_CBG专用"
 layout: keyed
@@ -15,7 +16,10 @@ mode_switch:
   macro: "Switch_mode"
   force_set: false
 
-version_cell: "F4"
+version_cell: "F4"             # 预算版本显示文本
+version_key_cell: "E4"         # 目标版本成员键（切版本写这里）
+version_current_cell: "G4"     # SAP 当前变量值
+version_match_cell: "H4"       # Y=目标与当前一致
 
 # 行匹配 — 渠道 + 科目 联合定位
 key_columns:

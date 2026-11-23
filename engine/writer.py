@@ -61,12 +61,21 @@ class PreflightResult:
     checks: list[tuple[str, bool, str]] = field(default_factory=list)
     matched_rows: list[dict] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    # 表单空白时需要在数据区新增行：先写维度列，再写月度数据。
+    key_updates: dict[str, object] = field(default_factory=dict)
+    new_rows: list[dict] = field(default_factory=list)
 
 
 class FormWriter:
     def __init__(self, engine: ExcelEngine, form_config: dict) -> None:
         self.engine = engine
         self.cfg = form_config
+        # 空白表单新增行的状态（每次 preflight 重置）
+        self._key_updates: dict[str, object] = {}
+        self._new_rows: list[dict] = []
+        self._blank_rows: Optional[list[int]] = None
+        # measure_blocks：按表头动态识别出来的 {度量: {期间: 列}}（每次 preflight 重置）
+        self._measure_map: Optional[dict[str, dict[str, str]]] = None
 
     # ---------- workbook / sheet ----------
 
@@ -95,12 +104,75 @@ class FormWriter:
         # 蓝色系且偏深 → 只读
         return not (b > r + 20 and b > 120)
 
-    def enter_edit_mode(self, sample_cell: Optional[str] = None) -> None:
-        """切换到编制（可编辑）状态。
+    _MODE_LABEL = "当前模式"
+    _MODE_QUERY_WORDS = ("查询", "只读")
+    _MODE_EDIT_WORDS = ("编制", "编辑")
 
-        优先看目标单元格填充色：
-        - 已经是白色/浅色 → 本表可直接录入，不要再调 Switch_mode（会对 AO 状态造成干扰）
-        - 蓝色只读 → 调用 Switch_mode 宏（等同点击"切换模式"按钮）
+    def _read_mode(self, sheet) -> tuple[str, str]:
+        """读取页面顶部的「当前模式」显示，返回 (模式文本, 来源单元格)。
+
+        优先用配置的 mode_display_cell（如价格表的 AM51）；否则扫描表头上方
+        55 行的文本，找「当前模式:」并取其右侧单元格。
+        """
+        cell = self.cfg.get("mode_display_cell")
+        if cell:
+            try:
+                return str(self.engine.read(sheet, cell) or "").strip(), cell
+            except ExcelError:
+                return "", cell
+
+        rows = int(self.cfg.get("mode_scan_rows")
+                   or max(int(self.cfg.get("header_row") or 0) + 5, 55))
+        try:
+            block = sheet.Range(f"A1:AZ{rows}").Value2
+        except Exception:
+            return "", ""
+        if not isinstance(block, tuple):
+            block = ((block,),)
+        for i, row_vals in enumerate(block, start=1):
+            if not isinstance(row_vals, tuple):
+                row_vals = (row_vals,)
+            for j, val in enumerate(row_vals, start=1):
+                if not (isinstance(val, str) and self._MODE_LABEL in val):
+                    continue
+                after = val.split(self._MODE_LABEL, 1)[1].lstrip(":： ")
+                if after.strip():
+                    return after.strip(), f"{self._col_letter(j)}{i}"
+                if j < len(row_vals):
+                    nxt = row_vals[j]
+                    if isinstance(nxt, str) and nxt.strip():
+                        return nxt.strip(), f"{self._col_letter(j + 1)}{i}"
+                try:
+                    nxt = sheet.Cells(i, j + 1).Value2
+                    return str(nxt or "").strip(), f"{self._col_letter(j + 1)}{i}"
+                except Exception:
+                    return "", ""
+        return "", ""
+
+    @classmethod
+    def _mode_state(cls, text: str) -> str:
+        """把模式显示文本归为 query / edit / 空。"""
+        t = str(text or "")
+        if any(w in t for w in cls._MODE_QUERY_WORDS):
+            return "query"
+        if any(w in t for w in cls._MODE_EDIT_WORDS):
+            return "edit"
+        return ""
+
+    def enter_edit_mode(self, sample_cell: Optional[str] = None,
+                        sample_cells: Optional[list[str]] = None) -> None:
+        """确保表单处于编制态，必要时调用 Switch_mode。
+
+        判定顺序：
+        1. 页面「当前模式」显示为编制/编辑 → 直接跳过（此时再调 Switch_mode
+           会反向切回只读）。
+        2. 显示为查询/只读，且目标单元格里确实有蓝色（只读）格 → 调切换宏。
+           查询态下 AO 只读格是蓝底，写入不会被识别，Plan_Save 会弹
+           「没有要保存的数据」（2026-11-23 实测）。
+        3. 显示为查询但目标格全是白底（如客户费用表）→ AO 允许直接写入，跳过。
+        4. 页面没有模式显示 → 按填充色兜底（全白即跳过）。
+        切换后用「当前模式」显示轮询确认，仍未进入编制态则报错，避免拿旧数据
+        继续跑后续计算。
         """
         wb, sheet = self._resolve(wait_open=False)
 
@@ -110,10 +182,46 @@ class FormWriter:
         label_cell = self.cfg.get("mode_label_cell")
         force = ms.get("force_set", False)
 
-        # 填充色为白不代表 AO 处于编制模式（实测：其他成本表在"查询"模式下输入区也是白底，
-        # 此时 Plan_Save 会弹"没有要保存的资源"并阻塞）。因此只要有 mode_cell 就必须切。
-        if sample_cell and self._cell_is_editable(sheet, sample_cell) and not mode_cell:
-            log.info(f"{sample_cell} 已是可编辑(非蓝色)，且本表无模式格，跳过模式切换")
+        cells = [c for c in (sample_cells or ([sample_cell] if sample_cell else [])) if c]
+        probe = cells[:60]
+        blue = sum(0 if self._cell_is_editable(sheet, c) else 1 for c in probe)
+        mode_text, mode_src = self._read_mode(sheet)
+        state = self._mode_state(mode_text)
+
+        if state == "edit":
+            log.info(f"当前模式={mode_text}（{mode_src}），已是编制态，跳过模式切换")
+            return
+
+        if state == "query":
+            if not probe or blue == 0:
+                log.info(f"当前模式={mode_text}（{mode_src}），目标格均为白底可录入，"
+                         f"按 AO 行为直接写入，跳过模式切换")
+                return
+            if not macro_name:
+                raise ExcelError(
+                    f"表单处于查询模式（{mode_src}={mode_text}），{blue}/{len(probe)} 个"
+                    f"目标格为蓝色只读，且配置未提供切换宏")
+            log.info(f"当前模式=查询，{blue}/{len(probe)} 个目标格为蓝色只读，"
+                     f"运行 {macro_name} 切换到编制态")
+            try:
+                self.engine.run_macro(macro_name, wb)
+            except ExcelError as exc:
+                raise ExcelError(f"{macro_name} 执行失败，无法进入编制态: {exc}")
+            interval = float(self.cfg.get("mode_poll_interval_sec", 1.0))
+            attempts = int(self.cfg.get("mode_poll_attempts", 15))
+            for _ in range(attempts):
+                time.sleep(interval)
+                mode_text, mode_src = self._read_mode(sheet)
+                if self._mode_state(mode_text) == "edit":
+                    log.info(f"模式已切换：{mode_src}={mode_text}")
+                    return
+            raise ExcelError(
+                f"{macro_name} 后模式仍为「{mode_text}」（{mode_src}），未能进入编制态；"
+                f"此时写入不会被保存")
+
+        # 页面无模式显示 → 按填充色兜底
+        if probe and blue == 0 and not mode_cell:
+            log.info(f"目标单元格均非蓝色且无模式显示，跳过模式切换")
             return
 
         # 既无切换宏、也无模式单元格 → 本表无需切换（如纯查询表）
@@ -180,11 +288,70 @@ class FormWriter:
     def _data_key(self, row: dict) -> str:
         key_cols = self.cfg.get("key_columns")
         if key_cols:
-            return "|".join(str(row.get(k["name"], "")).strip() for k in key_cols)
+            return "|".join(self._dim(row, k["name"]) for k in key_cols)
         if "item" in row:
-            return str(row["item"]).strip()
+            return self._dim(row, "item")
         # simple 表：数据首列即科目名
-        return str(next(iter(row.values()))).strip() if row else ""
+        return self._dim(row, next(iter(row))) if row else ""
+
+    @staticmethod
+    def _dim(row: dict, name: str) -> str:
+        """维度值转字符串；NaN/None/空串统一为空（不能把 'nan' 当成员）。"""
+        v = row.get(name)
+        return "" if _is_empty(v) else str(v).strip()
+
+    def _key_columns(self) -> list[str]:
+        key_cols = self.cfg.get("key_columns")
+        if key_cols:
+            return [k["column"] for k in key_cols]
+        return [self.cfg.get("item_column", "P")] + list(self.cfg.get("item_alternate_columns", []))
+
+    def _blank_check_columns(self) -> list[str]:
+        """判断一行是否完全空白时看的列。
+
+        组合键表必须所有维度列都为空才算空行；单科目表只看科目列——
+        AA/AB 可能放分组标题，不能因此把可录入行排除掉。
+        """
+        if self.cfg.get("key_columns"):
+            return self._key_columns()
+        return [self.cfg.get("item_column", "P")]
+
+    def _blank_row_pool(self, sheet) -> list[int]:
+        if self._blank_rows is not None:
+            return self._blank_rows
+        start, end = (self.cfg.get("input_rows") or [1, 100])[:2]
+        skip = set(self.cfg.get("skip_rows", []))
+        cols = self._blank_check_columns()
+        rows: list[int] = []
+        for r in range(start, end + 1):
+            if r in skip:
+                continue
+            if all(_is_empty(self.engine.read(sheet, f"{c}{r}")) for c in cols):
+                rows.append(r)
+        self._blank_rows = rows
+        log.info(f"表单空白可新增行 {len(rows)} 行（{start}-{end}）")
+        return rows
+
+    def _row_for_key(self, sheet, row_index: dict[str, int], key: str,
+                     key_values: Optional[dict[str, str]] = None) -> Optional[int]:
+        """已有组合键返回原行；否则取第一条空白行，登记维度写入（先维度后数据）。"""
+        if key in row_index:
+            return row_index[key]
+        if not key:
+            return None
+        rows = self._blank_row_pool(sheet)
+        if not rows:
+            return None
+        row = rows.pop(0)
+        values = key_values or {}
+        for col, value in values.items():
+            if _is_empty(value):
+                continue
+            self._key_updates[f"{col}{row}"] = value
+        row_index[key] = row
+        self._new_rows.append({"row": row, "key": key, "key_values": dict(values)})
+        log.info(f"新增行 {row}: {key}")
+        return row
 
     # ---------- 期间覆盖 ----------
 
@@ -204,11 +371,12 @@ class FormWriter:
         return periods
 
     def _configured_periods(self) -> set[str]:
-        """表单配置里声明了列的期间。"""
+        """表单配置里声明了列的期间（measure_blocks 优先用表头动态识别的结果）。"""
         layout = self.cfg.get("layout", "simple")
         if layout == "measure_blocks":
+            source = self._measure_map or (self.cfg.get("measures") or {})
             out: set[str] = set()
-            for cols in (self.cfg.get("measures") or {}).values():
+            for cols in source.values():
                 out.update((cols or {}).keys())
             return out
         if layout == "matrix":
@@ -221,11 +389,21 @@ class FormWriter:
 
         wb, sheet = self._resolve(wait_open=True)
         result = PreflightResult(ok=False)
+        self._key_updates = {}
+        self._new_rows = []
+        self._blank_rows = None
+        self._measure_map = None
         result.checks.append(("workbook", True, f"{wb.Name}"))
 
-        # 模式检查
+        # 模式检查 —— 只报告；真正的切换在写值前按「当前模式 + 目标格颜色」执行，
+        # 因为查询态下部分表单（客户费用）仍可直接写入，不能一概切换/判失败。
         mode_cell = self.cfg.get("mode_cell")
-        if mode_cell:
+        mode_text, mode_src = self._read_mode(sheet)
+        state = self._mode_state(mode_text)
+        if state:
+            note = "编制态" if state == "edit" else "查询态（写入前自动判断是否切换）"
+            result.checks.append(("编制模式", True, f"{mode_src}={mode_text}（{note}）"))
+        elif mode_cell:
             mode_val = self.engine.read(sheet, mode_cell) or ""
             ok = "编制" in str(mode_val)
             if not ok:
@@ -238,7 +416,7 @@ class FormWriter:
                     log.error(f"enter_edit_mode 失败: {exc}")
             result.checks.append(("编制模式", ok, f"{mode_cell}={mode_val}"))
         else:
-            result.checks.append(("编制模式", True, "(本表无模式切换)"))
+            result.checks.append(("编制模式", True, "(本表无模式显示)"))
 
         # 版本检查
         version_cell = self.cfg.get("version_cell")
@@ -264,8 +442,14 @@ class FormWriter:
 
         result.matched_rows = matched
         result.skipped = skipped
+        result.key_updates = dict(self._key_updates)
+        result.new_rows = list(self._new_rows)
         detail = f"key={'+'.join(k['name'] for k in key_cols)}" if key_cols else "item_column"
         result.checks.append(("行匹配", True, f"{detail}, 命中 {len(matched)} 格"))
+        if result.new_rows:
+            result.checks.append((
+                "新增行", True,
+                f"空白表单新增 {len(result.new_rows)} 行，先写 {len(result.key_updates)} 个维度格再写数据"))
 
         # 期间覆盖：数据里出现的期间必须都有对应列，否则会被静默丢弃
         data_periods = self._data_periods(data)
@@ -297,25 +481,42 @@ class FormWriter:
 
     def _cells_simple_keyed(self, sheet, row_index, data, key_cols, aliases) -> tuple[list, list]:
         month_cols = self.cfg.get("month_columns", {})
+        item_col = self.cfg.get("item_column", "P")
         matched, skipped = [], []
         for row in data:
-            key = self._data_key(row)
-            label = key.replace("|", " / ") or str(row.get("item", ""))
-            if key and key not in row_index:
-                # simple 表允许通过别名兜底
-                resolved = None
-                if not key_cols:
-                    for canonical, al in aliases.items():
-                        if (key in al or key == canonical) and canonical in row_index:
-                            resolved = canonical
-                            break
-                if resolved is None:
-                    skipped.append(label)
-                    continue
-                key = resolved
-                label = resolved
+            raw_key = self._data_key(row)
+            label = raw_key.replace("|", " / ") or str(row.get("item", ""))
+            key = raw_key
+            target_row = row_index.get(key)
 
-            target_row = row_index[key]
+            # simple 表允许通过别名兜底：数据里是"售后服务费-维修费"，表单行是"维修费"
+            if target_row is None and not key_cols:
+                canonical = None
+                for cand, al in aliases.items():
+                    if raw_key in al or raw_key == cand:
+                        canonical = cand
+                        break
+                if canonical:
+                    key = canonical
+                    target_row = row_index.get(canonical)
+
+            if target_row is None:
+                if key_cols:
+                    key_values = {k["column"]: self._dim(row, k["name"]) for k in key_cols}
+                    if any(not v for v in key_values.values()):
+                        skipped.append(f"{label} [维度缺失]")
+                        continue
+                else:
+                    if not key:
+                        skipped.append(label)
+                        continue
+                    key_values = {item_col: key}
+                target_row = self._row_for_key(sheet, row_index, key, key_values)
+                if target_row is None:
+                    skipped.append(f"{label} [无空白行]")
+                    continue
+                label = key.replace("|", " / ")
+
             for month, col_letter in month_cols.items():
                 if month not in row:
                     continue
@@ -329,23 +530,98 @@ class FormWriter:
                 })
         return matched, skipped
 
+    @staticmethod
+    def _col_letter(n: int) -> str:
+        s = ""
+        while n > 0:
+            n, rem = divmod(n - 1, 26)
+            s = chr(65 + rem) + s
+        return s
+
+    def _detect_measure_columns(self, sheet) -> Optional[dict[str, dict[str, str]]]:
+        """按表头动态识别度量块的 (度量 × 期间 → 列) 映射。
+
+        背景：AO 模板的度量块宽度随版本期间窗口变化（实测 2026.11 版是 7 列，
+        11-11 录制时是 6 列）。硬编码列会在块宽变化时整体错月——销量块错 1 列、
+        加权CT 错 2 列、销售收入错 3 列。因此以 `measure_name_row`（度量名）+
+        `header_row`（期间）两行表头为准，每次打开表单重新识别。
+        """
+        cfg = self.cfg
+        try:
+            header_row = int(cfg["header_row"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        name_row = int(cfg.get("measure_name_row") or header_row - 1)
+        config_measures = cfg.get("measures") or {}
+        if not config_measures:
+            return None
+
+        try:
+            used = sheet.UsedRange
+            first_col = int(getattr(used, "Column", 1) or 1)
+            count = int(getattr(getattr(used, "Columns", None), "Count", 0) or 0)
+        except Exception:
+            first_col, count = 1, 0
+        last_col = first_col + count - 1 if count else first_col + 99
+        last_col = min(last_col, first_col + 199)
+
+        def norm(v) -> str:
+            return re.sub(r"\s+", "", str(v or ""))
+
+        groups: dict[str, dict[str, str]] = {}
+        for n in range(first_col, last_col + 1):
+            col = self._col_letter(n)
+            name = norm(self.engine.read(sheet, f"{col}{name_row}"))
+            period = str(self.engine.read(sheet, f"{col}{header_row}") or "").strip()
+            if not name or not re.fullmatch(r"\d{4}\.\d{2}", period):
+                continue
+            groups.setdefault(name, {})[period] = col
+
+        mapping: dict[str, dict[str, str]] = {}
+        for measure in config_measures:
+            key = norm(measure)
+            for header, cols in groups.items():
+                if header == key or header.startswith(key) or key.startswith(header):
+                    mapping[measure] = cols
+                    break
+        if not mapping:
+            return None
+        missing = [m for m in config_measures if m not in mapping]
+        if missing:
+            log.warning(f"度量表头识别不完整，缺少 {missing}，回退配置列")
+            return None
+        log.info("度量块表头识别: " + "；".join(
+            f"{m}={sorted(cols)}" for m, cols in mapping.items()))
+        return mapping
+
     def _cells_measures(self, sheet, row_index, data) -> tuple[list, list]:
         """度量块布局：一行 = 一个维度组合 + 一个期间 + 多个度量值。
 
         期间取数据行的 `period_field`（默认"期间"）列，定位到该度量对应的列。
+        列映射优先按表头动态识别（见 `_detect_measure_columns`），识别不了才用配置。
         """
-        measures = self.cfg.get("measures", {})
+        if self._measure_map is None:
+            self._measure_map = self._detect_measure_columns(sheet)
+        measures = self._measure_map or self.cfg.get("measures", {})
         alias_map = self.cfg.get("measure_aliases", {})
         period_field = self.cfg.get("period_field", "期间")
         default_period = self.cfg.get("default_period")
+        key_cols = self.cfg.get("key_columns") or []
         matched, skipped = [], []
         for row in data:
             key = self._data_key(row)
             label = key.replace("|", " / ") or str(row.get("item", ""))
-            if key not in row_index:
-                skipped.append(label)
-                continue
-            target_row = row_index[key]
+            target_row = row_index.get(key)
+            if target_row is None:
+                key_values = {k["column"]: self._dim(row, k["name"]) for k in key_cols}
+                if not key or any(not v for v in key_values.values()):
+                    skipped.append(f"{label} [维度缺失]")
+                    continue
+                target_row = self._row_for_key(sheet, row_index, key, key_values)
+                if target_row is None:
+                    skipped.append(f"{label} [无空白行]")
+                    continue
+                label = key.replace("|", " / ")
 
             period = str(row.get(period_field, "")).strip() or default_period
             if not period:
@@ -404,14 +680,20 @@ class FormWriter:
                     return region_order.index(code) if code in region_order else None
             return None
 
+        item_col = self.cfg.get("item_column", "AA")
         matched, skipped = [], []
         for row in data:
             key = self._data_key(row)
             label = key.replace("|", " / ") or str(row.get("item", ""))
-            if key not in row_index:
-                skipped.append(label)
-                continue
-            target_row = row_index[key]
+            target_row = row_index.get(key)
+            if target_row is None:
+                if not key:
+                    skipped.append(label)
+                    continue
+                target_row = self._row_for_key(sheet, row_index, key, {item_col: key})
+                if target_row is None:
+                    skipped.append(f"{label} [无空白行]")
+                    continue
 
             region = str(row.get(region_field, "")).strip()
             idx = region_index(region)
@@ -432,6 +714,89 @@ class FormWriter:
                 })
         return matched, skipped
 
+    # ---------- 锁定检测 ----------
+
+    @staticmethod
+    def _looks_lock(text: str) -> bool:
+        text = str(text or "")
+        return bool(
+            re.search(r"被.{0,40}锁定", text)
+            or re.search(r"locked\s+by", text, re.I)
+            or ("表单" in text and "锁定" in text)
+            or ("表单" in text and "正在编辑" in text)
+        )
+
+    def _table_looks_readonly(self, sheet) -> bool:
+        """抽查数据区填充色：整片蓝色（只读）才认为可能是锁定/查询态。"""
+        start, end = (self.cfg.get("input_rows") or [1, 100])[:2]
+        key_cols = self._key_columns()
+        layout = self.cfg.get("layout", "simple")
+        if layout == "measure_blocks":
+            source = self._measure_map or (self.cfg.get("measures") or {})
+            data_cols = [next(iter(cols.values())) for cols in source.values() if cols]
+        elif layout == "matrix":
+            data_cols = list((self.cfg.get("period_blocks") or {}).values())[:1]
+        else:
+            data_cols = list((self.cfg.get("month_columns") or {}).values())[:2]
+        cols = list(dict.fromkeys((key_cols[:2] + data_cols[:2])))
+        if not cols:
+            return False
+        samples = [f"{c}{r}" for r in range(start, min(start + 4, end + 1)) for c in cols]
+        if not samples:
+            return False
+        return all(not self._cell_is_editable(sheet, addr) for addr in samples)
+
+    def detect_lock(self) -> Optional[str]:
+        """检测表单是否被其他用户锁定。
+
+        线索有三处：Excel 状态栏左下角提示、表单上的提示形状/文本框、
+        以及数据区全部变蓝（只读）。命中任一处就返回提示文本，由编排层中止流程。
+        """
+        try:
+            _wb, sheet = self._resolve(wait_open=False)
+        except ExcelError:
+            return None
+
+        app = getattr(self.engine, "_excel", None)
+        try:
+            status = getattr(app, "StatusBar", None) if app is not None else None
+        except Exception:
+            status = None
+        if isinstance(status, str) and self._looks_lock(status):
+            return status.strip()
+
+        try:
+            for shape in sheet.Shapes:
+                text = ""
+                try:
+                    if shape.TextFrame.HasText:
+                        text = str(shape.TextFrame.Characters().Text)
+                except Exception:
+                    pass
+                if text and self._looks_lock(text):
+                    return text.strip()
+        except Exception:
+            pass
+
+        if not self._table_looks_readonly(sheet):
+            return None
+
+        # 数据区整片蓝色时再扫单元格文本（提示可能写在页面左下角某格）
+        try:
+            vals = sheet.UsedRange.Value2
+            if isinstance(vals, tuple):
+                for row_vals in vals:
+                    if not isinstance(row_vals, tuple):
+                        row_vals = (row_vals,)
+                    for v in row_vals:
+                        if isinstance(v, str) and self._looks_lock(v):
+                            return v.strip()
+            elif isinstance(vals, str) and self._looks_lock(vals):
+                return vals.strip()
+        except Exception:
+            pass
+        return "表单数据区全部为只读（蓝色），疑似被其他用户锁定（未能读到用户名）"
+
     # ---------- write cycle ----------
 
     def write_and_save(self, preflight: PreflightResult, verify_after: bool = True) -> dict:
@@ -443,18 +808,32 @@ class FormWriter:
         mac = self.cfg.get("macros", {})
         result = {"written": 0, "saved": False, "verified": False, "failures": []}
 
-        # 先算好要写的单元格，用它作为"是否已可编辑"的采样点
+        # 先算好要写的单元格；拿多个目标格做颜色采样——价格表查询态下
+        # 单价列是白底、销量/CT 列才是蓝底，只看第一个格会误判为可编辑。
         updates = {row["cell"]: row["new_value"] for row in preflight.matched_rows}
-        sample_cell = next(iter(updates), None)
+        sample_cells = list(updates)
+        sample_cell = sample_cells[0] if sample_cells else None
 
-        # Ensure edit mode — 已是可编辑状态则不切模式
+        # Ensure edit mode — 按「当前模式」显示 + 采样格颜色决定是否切换
         try:
-            self.enter_edit_mode(sample_cell=sample_cell)
+            self.enter_edit_mode(sample_cell=sample_cell, sample_cells=sample_cells)
         except ExcelError as exc:
             result["failures"].append(f"edit_mode: {exc}")
             return result
 
-        # 1. write
+        # 1. write —— 空白表单必须先写维度（组织/渠道/品牌/产品…），
+        # AO 会按这些维度校验后面写入的月度数据。顺序反了可能被丢弃或串行。
+        key_updates = dict(getattr(preflight, "key_updates", {}) or {})
+        if key_updates:
+            log.info(f"先写维度 {len(key_updates)} 格（新增行）")
+            try:
+                self.engine.write_batch(sheet, key_updates)
+                result["keys_written"] = len(key_updates)
+            except ExcelError as exc:
+                result["failures"].append(f"write_dimensions: {exc}")
+                return result
+            time.sleep(2.0)                      # 让 AO 完成维度校验再写数值
+
         log.info(f"Writing {len(updates)} cells into {wb.Name}")
         try:
             self.engine.write_batch(sheet, updates)

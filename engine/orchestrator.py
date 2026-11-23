@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import logging
 import os
 import re
@@ -72,8 +73,56 @@ def _blank(v) -> bool:
     return v is None or (isinstance(v, str) and not v.strip())
 
 
+def _norm_version(text) -> str:
+    """版本名归一化：口语「财总会版」与 AO「财总版」视为同一个。"""
+    return re.sub(r"\s+", "", str(text or "")).replace("财总会版", "财总版")
+
+
+def _version_matches(expected, actual) -> bool:
+    e, a = _norm_version(expected), _norm_version(actual)
+    return bool(e and a and (e in a or a in e))
+
+
+def _lock_user(message: str) -> str:
+    """从「表单被XXX用户锁定」里提取用户名；提取不到返回空串。"""
+    text = str(message or "")
+    # 用户名可能是中文、英文 ID，也可能带空格（Zhang San）
+    m = re.search(r"被\s*(.{1,40}?)\s*(?:用户)?\s*锁定", text)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"locked\s+by\s+([^,.;\s]{1,40})", text, re.I)
+    return m.group(1).strip() if m else ""
+
+
+class FormLockedError(ExcelError):
+    """表单被其他用户锁定：跳过该表单并结束流程（不是普通失败，不重试）。"""
+
+    def __init__(self, form_id: str, label: str, message: str) -> None:
+        self.form_id = form_id
+        self.label = label
+        self.raw_message = " ".join(str(message or "").split())
+        self.user = _lock_user(self.raw_message)
+        if self.user:
+            text = (f"{label}表单被{self.user}用户锁定，已跳过{label}编辑并结束流程。"
+                    f"原始提示：{self.raw_message}")
+        else:
+            text = (f"{label}表单疑似被其他用户锁定（{self.raw_message}），"
+                    f"已跳过{label}编辑并结束流程。")
+        super().__init__(text)
+
+
+class SessionExpiredError(ExcelError):
+    """AO/BPC 会话失效。
+
+    与「Excel 断开」不同：进程和 COM 都还在，但导航表宏统一报 0x800A9C68、
+    右侧步骤面板不再随选中刷新、版本被重置回月初版。只有重开 Excel 重新
+    登录才能恢复，所以 run_with_recovery 会强制重启而不是复用原实例。
+    """
+
+
 class PbfFlow:
-    def __init__(self, engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Path) -> None:
+    def __init__(self, engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Path,
+                 persist_panel_cache: bool = False) -> None:
         self.engine = engine
         self.cfg = flow_cfg
         self.nav_cfg = flow_cfg["navigator"]
@@ -81,6 +130,22 @@ class PbfFlow:
         self.wb_cfg = flow_cfg.get("verify_writeback") or {}
         self.form_cfgs = form_cfgs
         self.data_dir = Path(data_dir)
+        # 导航表配置（含 dimensions.yaml 的版本单元格）；run_flow 会补充 dims_nav
+        self.nav_dims_cfg = dict(self.nav_cfg)
+        # 版本|nav_cell → 上次验证过的步骤面板指纹。
+        # 用于区分"面板已是该行的正确内容"（不必刷新）和"面板没刷新"（会话失效）。
+        # 跨进程持久化：上一次运行可能刚好把面板停在目标行，新进程若无法识别，
+        # 会把"内容没变化"误判成会话失效，触发不必要的 Excel 重启和重新登录。
+        self._panel_cache: dict[str, str] = {}
+        self.persist_panel_cache = persist_panel_cache
+        self._panel_cache_file = app_root() / "logs" / "nav_panel_cache.json"
+        if persist_panel_cache:
+            self._load_panel_cache()
+        # 每张表单打开后要核对的版本（由 run_flow 根据 --version-key/--version 设置）
+        self.form_version_key: Optional[str] = None
+        self.form_version_display: Optional[str] = None
+        # read_indicators 是否读到目标期间指标全 0（清 0 模式放行时置 True）
+        self.indicators_all_zero = False
 
         # 目标期间：优先 verify.target_period，否则从数据目录名推导。
         # 目录名可能含多个期间（如 data_2027.01_2027.04），取最大期间，保证损益核对
@@ -134,10 +199,128 @@ class PbfFlow:
         ws = self._nav_ws()
         v = self._read(ws, self.nav_cfg["version_cell"])
         v = "" if v is None else str(v)
-        if expected and expected not in v:
+        if expected and not _version_matches(expected, v):
             raise ExcelError(f"版本不符：当前 '{v}'，期望包含 '{expected}'")
         log.info(f"版本确认: {v}")
         return v
+
+    def ensure_navigator_version(self) -> str:
+        """导航表版本必须与表单目标版本一致。
+
+        长流程中 AO 会话掉线后，导航表会被重置回默认的月初版；此时继续
+        打开运行包/损益表会拿到错误版本的数据。发现漂移就切回并刷新。
+        """
+        expected = self.form_version_display
+        key = self.form_version_key
+        if not expected and not key:
+            return ""
+        ws = self._nav_ws()
+        current = str(self._read(ws, self.nav_cfg["version_cell"]) or "")
+        if expected and _version_matches(expected, current):
+            return current
+
+        log.warning(f"导航表版本漂移：当前 '{current}'，目标 '{expected or key}'，重新切换")
+        if not key:
+            raise SessionExpiredError(
+                f"导航表版本为 '{current}'，期望 '{expected}'，但没有版本成员键，"
+                "无法自动切回；请重新登录 AO 后重试")
+        try:
+            from .navigator import Navigator
+
+            Navigator(self.engine, self.nav_dims_cfg).switch_version(key, expected)
+            self.refresh_flow_retry(attempts=2, delay=5)
+        except SessionExpiredError:
+            raise
+        except ExcelError as exc:
+            raise SessionExpiredError(f"导航表版本切回失败：{exc}") from exc
+
+        current = str(self._read(ws, self.nav_cfg["version_cell"]) or "")
+        if expected and not _version_matches(expected, current):
+            raise SessionExpiredError(
+                f"导航表版本切回后仍为 '{current}'（目标 '{expected}'），"
+                "AO/BPC 会话可能已失效")
+        log.info(f"导航表版本已切回: {current}")
+        return current
+
+    def ensure_form_version(self, form_id: str) -> None:
+        """打开表单后核对其预算版本；不是目标版本就写入成员键并点「刷新表单」。
+
+        背景：从月初版快捷方式进入 PBF 时，新打开的表单可能仍是月初版。
+        表单版本区：F4=显示文本，E4=目标成员键，G4=SAP 当前变量值，H4=是否一致。
+        实测：写 E4 后 F4 立即变化，执行 Refresh_Sheet 后 G4/H4 才更新。
+        """
+        cfg = self.form_cfgs[form_id]
+        disp_cell = cfg.get("version_cell")
+        key = self.form_version_key
+        expected = self.form_version_display
+        if not disp_cell or (not key and not expected):
+            return
+
+        pattern = cfg["workbook_pattern"]
+        key_cell = cfg.get("version_key_cell", "E4")
+        cur_cell = cfg.get("version_current_cell", "G4")
+        match_cell = cfg.get("version_match_cell", "H4")
+
+        def state():
+            wb = self.engine.get_workbook(pattern, wait_sec=30)
+            ws = self.engine.open_sheet(wb, cfg["sheet"])
+            vals = {
+                "display": self._read(ws, disp_cell),
+                "key": self._read(ws, key_cell) if key_cell else None,
+                "current": self._read(ws, cur_cell) if cur_cell else None,
+                "match": self._read(ws, match_cell) if match_cell else None,
+            }
+            return wb, ws, vals
+
+        def is_ok(vals: dict) -> bool:
+            if expected and not _version_matches(expected, vals["display"]):
+                return False
+            if key:
+                if key_cell and str(vals["key"] or "").strip() != key:
+                    return False
+                if cur_cell and str(vals["current"] or "").strip() != key:
+                    return False
+            if match_cell and str(vals["match"] or "").strip() not in ("", "Y"):
+                return False
+            return True
+
+        wb, ws, vals = state()
+        if is_ok(vals):
+            log.info(f"{form_id} 版本正确: {vals['display']}")
+            return
+        if not key:
+            raise ExcelError(
+                f"{form_id} 版本不符：当前 '{vals['display']}'，"
+                f"期望 '{expected}'，但未提供版本成员键，无法自动切换")
+        if not key_cell:
+            raise ExcelError(f"{form_id} 未配置 version_key_cell，无法自动切换版本")
+
+        log.warning(
+            f"{form_id} 版本为 '{vals['display']}'，切换到 '{expected or key}' ({key}) 并刷新表单")
+        self.engine.write(ws, key_cell, key)
+
+        macro = (cfg.get("macros") or {}).get("refresh") or "Refresh_Sheet"
+        try:
+            self.engine.run_macro(macro, wb)
+        except ExcelError as exc:
+            raise ExcelError(f"{form_id} 刷新表单失败，无法切换版本: {exc}") from exc
+
+        deadline = time.time() + 90
+        last = vals
+        while time.time() < deadline:
+            time.sleep(2)
+            try:
+                _wb, _ws, last = state()
+            except ExcelError as exc:
+                log.warning(f"{form_id} 刷新后暂时读不到表单，继续等待: {exc}")
+                continue
+            if is_ok(last):
+                log.info(f"{form_id} 版本已切换并刷新: {last['display']}")
+                return
+        raise ExcelError(
+            f"{form_id} 切版本未生效：显示 '{last['display']}'，"
+            f"目标键 {key}，当前值 '{last['current']}'，一致性 '{last['match']}'。"
+            "请在 AO 中手动选择版本后重试")
 
     def refresh_flow(self) -> None:
         wb = self._nav_wb()
@@ -149,7 +332,7 @@ class PbfFlow:
             # 会话过期，或版本与目标期间不匹配。给一句能直接下手的人话。
             if ("发生意外" in text or "-2147352567" in text
                     or "-2146788248" in text or "0x800A9C68" in text):
-                raise ExcelError(
+                raise SessionExpiredError(
                     "刷新流程（Refresh_Status）失败：AO/BPC 会话可能已过期，或版本与目标期间不匹配。"
                     "请手动打开 Excel 的 Analysis 选项卡确认已连接 BPC 并重新登录；"
                     "若期间超出当前版本窗口，请先在 AO 里把版本滚动到覆盖该期间的版本后重试。"
@@ -176,19 +359,25 @@ class PbfFlow:
                     time.sleep(delay)
         raise last  # type: ignore[misc]
 
-    def recover(self) -> bool:
-        """Excel 断开后自动恢复：重开导航表 → 重新登录 → 换上新的引擎。
+    def recover(self, session_expired: bool = False) -> bool:
+        """Excel 断开/AO 会话失效后自动恢复：重开导航表 → 重新登录 → 换上新的引擎。
+
+        session_expired=True 时必须强制重启 Excel：会话失效时进程还在、
+        导航表也还开着，复用旧实例无法重建 BPC 会话。
 
         返回 True 表示已恢复，调用方可以重做失败的步骤；False 表示恢复失败。
         """
         rcfg = self.cfg.get("recovery") or {}
-        log.warning("Excel 连接已断开，开始自动恢复…")
+        if session_expired:
+            log.warning("AO/BPC 会话已失效，重新打开 Excel 并登录以恢复…")
+        else:
+            log.warning("Excel 连接已断开，开始自动恢复…")
         # 只结束本流程连接的那个 Excel 进程；不碰用户同时打开的其它 Excel。
         stale_pid = getattr(self.engine, "pid", None)
         try:
             self.engine = ensure_excel_ready(
                 self.cfg, kill_stale=bool(rcfg.get("kill_stale_excel", True)),
-                stale_pid=stale_pid)
+                stale_pid=stale_pid, force_restart=session_expired)
         except Exception as exc:
             log.error(f"自动恢复失败：{exc}")
             return False
@@ -258,10 +447,103 @@ class PbfFlow:
         else:
             log.info(f"期间校验通过：版本 {start} 起，目标 {self.target_period}")
 
+    # ---------- 右侧「步骤事项」面板 ----------
+
+    def _panel_range(self) -> str:
+        return str(self.nav_cfg.get("panel_range") or "AP48:AU60")
+
+    def _panel_fingerprint(self) -> str:
+        """面板指纹。面板是 VBA 按选中的业务单元静态写入的，选中后必须变化。
+
+        会话掉线时 VBA 宏会静默失败，面板停在上一张表的清单——此时 AT52
+        的文案可能仍是"打开"，点下去却打开错误的东西或毫无反应。
+        """
+        ws = self._nav_ws()
+        rng = self._panel_range()
+        try:
+            vals = self.engine._retry(lambda: ws.Range(rng).Value2)
+        except Exception as exc:
+            raise ExcelError(f"读取导航步骤面板 {rng} 失败: {exc}") from exc
+        if not isinstance(vals, tuple):
+            vals = ((vals,),)
+        elif vals and not isinstance(vals[0], tuple):
+            vals = (vals,)
+        flat: list[str] = []
+        for row in vals:
+            for v in row:
+                flat.append("" if v is None else str(v).strip())
+        return "|".join(flat)
+
+    def _panel_cache_key(self, nav_cell: str) -> str:
+        """面板指纹按「版本|业务单元」区分：不同版本的步骤清单可能不同。"""
+        ver = self.form_version_display or self.form_version_key or ""
+        return f"{ver}|{nav_cell}"
+
+    def _load_panel_cache(self) -> None:
+        try:
+            data = json.loads(self._panel_cache_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            log.debug(f"读取面板缓存失败（忽略）: {exc}")
+            return
+        if isinstance(data, dict):
+            self._panel_cache.update(
+                {str(k): v for k, v in data.items() if isinstance(v, str)})
+
+    def _save_panel_cache(self) -> None:
+        if not self.persist_panel_cache:
+            return
+        try:
+            self._panel_cache_file.parent.mkdir(parents=True, exist_ok=True)
+            self._panel_cache_file.write_text(
+                json.dumps(self._panel_cache, ensure_ascii=False, indent=1),
+                encoding="utf-8")
+        except Exception as exc:
+            log.debug(f"保存面板缓存失败（忽略）: {exc}")
+
+    def _select_nav_cell(self, ws, nav_cell: str) -> None:
+        """选中业务单元行。
+
+        SelectionChange 只在选中格**变化**时触发；重试时若仍选着同一格，
+        面板不会再刷新（这也是 AT52 点下去没反应的原因之一）。先点 A1
+        强制一次变化，再选目标格。
+        """
+        try:
+            ws.Range("A1").Select()
+        except Exception:
+            pass
+        self.engine._retry(lambda: ws.Range(nav_cell).Select(), attempts=5, delay=2)
+
+    def _wait_panel_refresh(self, ws, nav_cell: str, btn: str,
+                            before: str, timeout_sec: float) -> tuple[bool, str, bool]:
+        """等面板刷新出"打开"按钮；返回 (是否刷新, 按钮当前文案, 是否命中缓存)。
+
+        命中缓存（面板内容 == 该行上次验证过的正确指纹）也算刷新成功：
+        上一次运行可能刚好把面板停在这一行，选中前后内容一致属正常。
+        """
+        deadline = time.time() + max(float(timeout_sec), 1.0)
+        cached = self._panel_cache.get(self._panel_cache_key(nav_cell))
+        btn_text = ""
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                now = self._panel_fingerprint()
+                btn_text = str(self._read(ws, btn) or "").strip()
+            except ExcelError as exc:
+                log.warning(f"等待 {nav_cell} 面板时读取失败（继续等）: {exc}")
+                continue
+            if "打开" in btn_text:
+                if now != before:
+                    return True, btn_text, False
+                if cached is not None and now == cached:
+                    return True, btn_text, True
+        return False, btn_text, False
+
     def open_via_nav(self, nav_cell: str, open_cell: Optional[str] = None,
                      expect: str = "form", wait_sec: Optional[int] = None,
                      pattern: Optional[str] = None) -> str:
-        """选中业务单元行 → 点"打开" → 返回新打开的工作簿名。
+        """选中业务单元行 → 等面板刷新 → 点"打开" → 返回新打开的工作簿名。
 
         expect: 'form' 期望打开编制表；'package' 期望打开运行包清单。
         pattern: 编制表的 workbook_pattern（有些表单名里没有"编制"二字，只能按模式匹配）。
@@ -269,15 +551,61 @@ class PbfFlow:
         wb = self._nav_wb()
         ws = self.engine.open_sheet(wb, self.nav_cfg["sheet"])
         btn = open_cell or self.nav_cfg["open_button_cell"]
+        panel_wait = float(self.nav_cfg.get("panel_wait_sec") or 15)
 
         # "打开"靠导航表的 SelectionChange 触发，偶尔会被 Excel/AO 忙吞掉，因此重试几轮
         last_names: list[str] = []
+        via_cache = False
         for attempt in range(1, 4):
             self.engine._retry(lambda: (wb.Activate(), ws.Activate()), attempts=5, delay=2)
             before = set(self.engine._retry(
                 lambda: self.engine.workbook_names(), attempts=5, delay=2))
-            self.engine._retry(lambda: ws.Range(nav_cell).Select(), attempts=5, delay=2)
-            time.sleep(5)                  # 等右侧面板加载出"打开"
+            before_panel = self._panel_fingerprint()
+            self._select_nav_cell(ws, nav_cell)
+            fresh, btn_text, via_cache = self._wait_panel_refresh(
+                ws, nav_cell, btn, before_panel, panel_wait)
+
+            if not fresh:
+                log.warning(
+                    f"选中 {nav_cell} 后步骤面板未刷新（{btn}='{btn_text}'），"
+                    "疑似 AO/BPC 会话已失效")
+                if attempt == 1:
+                    # 先走工具自带的「刷新流程」：它正好能区分瞬时忙和会话过期
+                    try:
+                        self.refresh_flow_retry(attempts=2, delay=5)
+                    except SessionExpiredError:
+                        raise
+                    except ExcelError as exc:
+                        raise SessionExpiredError(
+                            f"选中 {nav_cell} 后面板未刷新，刷新流程也失败：{exc}") from exc
+                    continue
+                raise SessionExpiredError(
+                    f"选中 {nav_cell} 后步骤面板一直没有刷新（{btn}='{btn_text}'）。"
+                    "AO/BPC 会话可能已过期，需要重新打开 Excel 并登录；"
+                    "请确认 AO 已连接 BPC 后重试。")
+
+            if "打开" not in btn_text:
+                raise ExcelError(
+                    f"{nav_cell} 的步骤面板已刷新，但 {btn} 不是「打开」（实际 '{btn_text}'）。"
+                    f"请检查该步骤的行号配置（当前 {btn}）与面板内容。")
+
+            row = "".join(ch for ch in btn if ch.isdigit())
+            row_type = str(self._read(ws, f"AR{row}") or "").strip() if row else ""
+            want = {"form": "表单", "package": "运行包"}.get(expect)
+            if want and row_type and row_type != want:
+                names = []
+                for r in range(50, 66):
+                    nm = self._read(ws, f"AP{r}")
+                    if nm:
+                        names.append(f"{r}:{nm}")
+                raise ExcelError(
+                    f"{nav_cell} 的 {btn} 对应行类型是「{row_type}」而不是「{want}」，"
+                    f"行号可能配错。当前面板：{' | '.join(names[:8])}")
+
+            # 行类型校验通过，说明这就是该行的正确面板；记下来供下次（含新进程）识别
+            self._panel_cache[self._panel_cache_key(nav_cell)] = self._panel_fingerprint()
+            self._save_panel_cache()
+
             self.engine._retry(lambda: ws.Range(btn).Select(), attempts=5, delay=2)
 
             deadline = time.time() + (wait_sec or self.nav_cfg["open_wait_sec"])
@@ -304,6 +632,12 @@ class PbfFlow:
                 return late
             log.warning(f"第 {attempt} 次点击 {btn} 未打开工作簿，重试（当前：{last_names}）")
             time.sleep(2)
+        if via_cache:
+            # 面板内容与上次验证过的正确指纹一致、按钮也是「打开」，点下去却毫无反应：
+            # 典型是会话已死但面板停在旧内容。按会话失效处理，强制重启恢复。
+            raise SessionExpiredError(
+                f"选中 {nav_cell} 并点击 {btn} 后未打开新工作簿（面板内容与上次一致，"
+                "按钮为「打开」）。AO/BPC 会话可能已过期，需要重新打开 Excel 并登录。")
         raise ExcelError(f"选中 {nav_cell} 并点击 {btn} 后未打开新工作簿（已重试 3 次）")
 
     def _find_opened(self, pattern: Optional[str], expect: str) -> Optional[str]:
@@ -331,6 +665,15 @@ class PbfFlow:
         self._close_if_open(pattern)
         self.open_via_nav(step["nav_cell"], self.nav_cfg["open_button_cell"], "form",
                           pattern=pattern)
+        self.engine.get_workbook(pattern, wait_sec=30)
+
+        # 锁定表单不要尝试切版本/写数据；命中后由 run_flow 跳过并结束流程
+        lock = FormWriter(self.engine, cfg).detect_lock()
+        if lock:
+            raise FormLockedError(form_id, str(cfg.get("label") or form_id), lock)
+
+        # 从月初版快捷端口打开的表单可能仍是月初版：逐表核对并刷新到目标版本
+        self.ensure_form_version(form_id)
         self.engine.get_workbook(pattern, wait_sec=30)
 
         data = self._load_data(self.data_dir / step["data"])
@@ -380,6 +723,7 @@ class PbfFlow:
         self._close_if_open(pattern)
         self.open_via_nav(nav_cell, self.nav_cfg["open_button_cell"], "form",
                           pattern=pattern)
+        self.ensure_form_version(form_id)
         wb = self.engine.get_workbook(pattern, wait_sec=60)
         ws = self.engine.open_sheet(wb, cfg["sheet"])
 
@@ -411,6 +755,17 @@ class PbfFlow:
                           pattern=pattern)
         self.engine.get_workbook(pattern, wait_sec=30)
 
+        lock = FormWriter(self.engine, cfg).detect_lock()
+        if lock:
+            self._close_if_open(pattern)
+            return {
+                "form": form_id, "ok": False, "matched": 0, "skipped": [],
+                "checks": [("锁定", False, lock)], "locked": lock,
+            }
+
+        self.ensure_form_version(form_id)
+        self.engine.get_workbook(pattern, wait_sec=30)
+
         data = self._load_data(self.data_dir / step["data"])
         pf = FormWriter(self.engine, cfg).preflight(data)
         out = {
@@ -438,6 +793,7 @@ class PbfFlow:
 
     def run_package(self, nav_cell: str, step_row: int) -> dict:
         """打开运行包清单 → Execute → 轮询状态 → 关闭。"""
+        self.ensure_navigator_version()
         self._close_if_open(self.pkg_cfg["workbook_pattern"])
         self.open_via_nav(nav_cell, open_cell=f"AT{step_row}",
                           expect="package", wait_sec=20)
@@ -484,8 +840,15 @@ class PbfFlow:
 
     # ---------- 损益核对 ----------
 
-    def read_indicators(self) -> dict:
+    def read_indicators(self, allow_all_zero: bool = False) -> dict:
+        """读损益指标。
+
+        allow_all_zero=True 用于「清 0」流程：目标期间本来就被清成全 0，
+        指标全 0 是预期结果，只告警不报错（否则清 0 会被误判为运行包没生效）。
+        """
+        self.indicators_all_zero = False
         vcfg = self.cfg["verify"]
+        self.ensure_navigator_version()
         self._close_if_open("YC_CBG损益查询表*")
         self.open_via_nav(vcfg["nav_cell"], open_cell=f"AT{vcfg['form_row']}",
                           expect="any", wait_sec=20)
@@ -545,15 +908,29 @@ class PbfFlow:
 
         # 指标合理性：目标期间全空/全 0 基本意味着运行包没生效，不能当成功结果返回
         if target:
-            vals = {name: _num(rows.get(target)) for name, rows in out.items()}
-            if all(v is None or v == 0 for v in vals.values()):
+            self._check_target_indicators(out, target, allow_all_zero)
+        return out
+
+    def _check_target_indicators(self, out: dict, target: str,
+                                 allow_all_zero: bool) -> bool:
+        """校验目标期间指标不全为空/0；返回是否全 0。
+
+        全 0 基本意味着运行包没生效，不能当成功结果返回——除非是清 0 流程
+        （allow_all_zero=True），此时全 0 正是目标状态。
+        """
+        vals = {name: _num(rows.get(target)) for name, rows in out.items()}
+        if all(v is None or v == 0 for v in vals.values()):
+            if not allow_all_zero:
                 raise ExcelError(
                     f"损益核对 {target} 的指标全部为空或为 0，运行包可能未生效。"
                     f"请先确认三个运行包状态为「已完成」后重试。指标: {list(out)}")
-            zero = [name for name, v in vals.items() if v is None or v == 0]
-            if zero:
-                log.warning(f"损益核对 {target} 以下指标为 0/空: {zero}")
-        return out
+            self.indicators_all_zero = True
+            log.warning(f"损益核对 {target} 指标全部为 0（清 0 模式，按预期放行）")
+            return True
+        zero = [name for name, v in vals.items() if v is None or v == 0]
+        if zero:
+            log.warning(f"损益核对 {target} 以下指标为 0/空: {zero}")
+        return False
 
     # ---------- 期间解析 ----------
 
@@ -670,12 +1047,16 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
              expected_version: Optional[str] = None,
              from_step: Optional[str] = None,
              preflight_only: bool = False,
-             switch_version_key: Optional[str] = None) -> dict:
+             switch_version_key: Optional[str] = None,
+             clear_mode: bool = False) -> dict:
     """from_step: 从第几步开始（1 开始的序号，或表单 ID），之前的步骤整步跳过。
 
     跳过的步骤连它的计算宏和运行包一起跳过（这些属于该步骤的收尾动作）。
+    clear_mode: 清 0 流程。目标期间损益指标全 0 属预期结果，核对只告警不报错。
     """
-    flow = PbfFlow(engine, flow_cfg, form_cfgs, data_dir)
+    # 面板指纹跨进程落盘：上次运行可能把面板停在某一行，新进程要能识别出来，
+    # 否则"选中前后内容一致"会被误判为会话失效（见 logs/nav_panel_cache.json）
+    flow = PbfFlow(engine, flow_cfg, form_cfgs, data_dir, persist_panel_cache=True)
     report: dict[str, Any] = {"version": "", "steps": [], "packages": [], "indicators": {}}
 
     steps = flow_cfg["steps"]
@@ -744,20 +1125,25 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
             except Exception as exc:            # 包含未包装的 com_error
                 del report["steps"][steps_len:]      # 丢掉这次重试前的半成品记录
                 del report["packages"][pkgs_len:]
-                if attempt >= attempts or not is_disconnect(exc):
+                session_expired = isinstance(exc, SessionExpiredError)
+                if attempt >= attempts or not (is_disconnect(exc) or session_expired):
                     raise
-                log.warning(f"{label} 因 Excel 断开失败：{exc}")
-                if not flow.recover():
+                reason = "AO 会话失效" if session_expired else "Excel 断开"
+                log.warning(f"{label} 因{reason}失败：{exc}")
+                if not flow.recover(session_expired=session_expired):
                     raise
                 log.info(f"Excel 已恢复，重做：{label}")
 
     # 5) 切版本（用户路径第 ⑤ 步）：先切到选定版本，再「刷新状态」。
+    dims_file = app_root() / "config" / "dimensions.yaml"
+    dims = yaml.safe_load(dims_file.read_text(encoding="utf-8")) or {}
+    dims_nav = dims.get("navigator") or {}
+    versions = dims.get("versions") or {}
+    # 版本单元格在 dimensions.yaml，其余导航配置在 flow.yaml；合并给 Navigator 用
+    flow.nav_dims_cfg = {**dims_nav, **flow.nav_cfg}
     switched_display: Optional[str] = None
     if switch_version_key:
-        dims_file = app_root() / "config" / "dimensions.yaml"
-        dims = yaml.safe_load(dims_file.read_text(encoding="utf-8")) or {}
-        dims_nav = dims.get("navigator") or {}
-        switched_display = (dims.get("versions") or {}).get(switch_version_key)
+        switched_display = versions.get(switch_version_key)
         run_with_recovery(
             lambda: Navigator(engine, dims_nav).switch_version(
                 switch_version_key, switched_display),
@@ -768,6 +1154,24 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
     report["version"] = run_with_recovery(
         lambda: flow.confirm_version(expected), "版本确认")
     flow.check_version_window(report["version"])
+
+    # 表单级版本：每张表打开后按这个目标核对，不是就切并刷新。
+    # 优先用 --version-key；否则按显示名反查；再退回导航表 C20 当前成员。
+    form_key = switch_version_key
+    if not form_key and expected_version:
+        form_key = next(
+            (k for k, d in versions.items() if _version_matches(expected_version, d)), None)
+    if not form_key:
+        try:
+            form_key = Navigator(engine, dims_nav).current_version_key()
+        except ExcelError as exc:
+            log.warning(f"读取导航表当前版本成员失败，表单将只核对显示文本: {exc}")
+    if form_key:
+        flow.form_version_key = form_key
+        flow.form_version_display = versions.get(form_key) or report["version"] or expected_version
+        report["form_version_key"] = form_key
+        report["form_version_display"] = flow.form_version_display
+        log.info(f"表单目标版本: {flow.form_version_display} ({form_key})")
     # AO 刚登录时 Refresh_Status 偶发瞬时失败，内部重试；仍失败才交给恢复机制
     run_with_recovery(flow.refresh_flow_retry, "刷新流程")
 
@@ -819,7 +1223,9 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
                     raise ExcelError(f"运行包未成功: {r}")
 
     if only_verify:
-        report["indicators"] = run_with_recovery(flow.read_indicators, "损益核对")
+        report["indicators"] = run_with_recovery(
+            lambda: flow.read_indicators(allow_all_zero=clear_mode), "损益核对")
+        report["indicators_all_zero"] = flow.indicators_all_zero
         return report
 
     for i, step in enumerate(steps):
@@ -827,7 +1233,20 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
         if i < start_idx:
             log.info(f"跳过步骤 {i + 1}（{form_id}）")
             continue
-        run_with_recovery(lambda s=step: run_step(s), f"步骤 {i + 1}（{form_id}）")
+        try:
+            run_with_recovery(lambda s=step: run_step(s), f"步骤 {i + 1}（{form_id}）")
+        except FormLockedError as exc:
+            # 业务要求：变动费用等表单被其他用户锁定时跳过该表并结束流程，
+            # 不要把后面的计算/运行包/损益核对带着旧数据继续跑。
+            report["locked"] = {
+                "form": exc.form_id, "label": exc.label,
+                "user": exc.user, "message": str(exc),
+            }
+            report["stopped"] = "locked"
+            log.error(str(exc))
+            return report
 
-    report["indicators"] = run_with_recovery(flow.read_indicators, "损益核对")
+    report["indicators"] = run_with_recovery(
+        lambda: flow.read_indicators(allow_all_zero=clear_mode), "损益核对")
+    report["indicators_all_zero"] = flow.indicators_all_zero
     return report
