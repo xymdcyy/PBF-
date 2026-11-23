@@ -622,7 +622,7 @@ def cmd_run_flow(args) -> None:
     try:
         from_step = resolve_from_step(flow_cfg, raw_from_step)
     except ValueError as exc:
-        raise SystemExit(str(exc))
+        raise SystemExit(f"[错误] {exc}")
 
     # 先做离线校验：配置/数据有问题时不要启动 Excel、更不要跑到一半才失败
     validate_before_run(flow_cfg, form_cfgs, data_dir,
