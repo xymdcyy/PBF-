@@ -646,15 +646,19 @@ class PbfFlow:
             if v is None:
                 continue
             # AO 表头可能是文本 / 数字 / 日期，统一归一化后再匹配。
-            # 单个异常单元格（NaN/inf、异常公式）不能让整轮核对中断。
+            # 单个异常单元格（NaN/inf、异常公式）不能让整轮核对中断；
+            # 只捕获归一化里可能抛的转换类异常（float/int 对怪值），别把
+            # COM/属性错误也吞掉。
             try:
                 key, new_prev = normalize_period_header(v, prev)
-            except Exception as exc:
+            except (ValueError, TypeError, OverflowError) as exc:
                 log.warning(f"表头 {letter}{header_row}={v!r} 解析失败，已跳过: {exc}")
                 continue
             if new_prev != prev:
                 prev = new_prev
-            if key and key not in found:
+            # 只保留期间键（'YYYY' / 'YYYY.MM'）：NaN 经 str() 会变成 "nan"，
+            # 杂散文本也会进表，混进 found 会污染"未找到期间"的报错信息。
+            if key and key not in found and re.fullmatch(r"\d{4}(\.\d{2})?", key):
                 found[key] = letter
         return found
 
