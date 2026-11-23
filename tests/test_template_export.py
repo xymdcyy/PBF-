@@ -144,7 +144,7 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(rows["价格销量CT.csv"], 1)
 
     def test_persistent_rename_failure_raises_and_keeps_stale(self) -> None:
-        # rename 重试耗尽仍失败：异常向上抛，上一轮 CSV 不被清掉
+        # rename 重试耗尽仍失败：异常向上抛，上一轮 CSV 内容原样保留
         self._write_stale()
 
         def always_fail(self, target, **kw):
@@ -153,6 +153,9 @@ class ExportTests(unittest.TestCase):
         with mock.patch("pathlib.Path.rename", always_fail):
             with self.assertRaises(PermissionError):
                 export_template(self.template, ["2027.01"], self.out)
+        for name in EXPORT_FILES:
+            self.assertEqual((self.out / name).read_text(encoding="utf-8"), "OLD\n",
+                             f"{name} 在 rename 失败后被改动")
 
 
 if __name__ == "__main__":
