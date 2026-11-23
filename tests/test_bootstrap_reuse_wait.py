@@ -25,7 +25,8 @@ class ReuseWaitSecTests(unittest.TestCase):
                          30.0)  # yaml 里引号包着的数字也接受
 
     def test_invalid_value_falls_back(self) -> None:
-        for bad in ("abc", object(), 0, -5):
+        # True/False 是 int 子类：True 会 float 成 1.0，须显式排除
+        for bad in ("abc", object(), True, False, 0, -5):
             with self.subTest(bad=bad):
                 self.assertEqual(_reuse_login_wait_sec({"login": {"reuse_wait_sec": bad}}),
                                  REUSE_LOGIN_WAIT_SEC)

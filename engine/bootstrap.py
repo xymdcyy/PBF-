@@ -33,6 +33,11 @@ def _reuse_login_wait_sec(flow_cfg: dict) -> float:
     raw = login_cfg.get("reuse_wait_sec") if isinstance(login_cfg, dict) else None
     if raw is None:
         return REUSE_LOGIN_WAIT_SEC
+    if isinstance(raw, bool):
+        # bool 是 int 子类，True 会 float 成 1.0——YAML 误写 true 就成了"只等 1 秒"
+        log.warning("login.reuse_wait_sec=%r 不是数字，回退默认 %ss",
+                    raw, REUSE_LOGIN_WAIT_SEC)
+        return REUSE_LOGIN_WAIT_SEC
     try:
         val = float(raw)
     except (TypeError, ValueError):
