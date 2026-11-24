@@ -26,6 +26,14 @@ log = logging.getLogger(__name__)
 # {00024505-00<ver>-0000-C000-000000000046}（其 LocalServer32 仍指向真实 EXCEL.EXE），
 # Dispatch 后校验 Version>=14 区分真假。见 _real_excel_clsids()。
 
+# AO 忙时调用被拒（RPC_E_CALL_REJECTED）是常态。单次调用内的重试要保持短：
+# 一次切版本步骤里会连着十几个 COM 调用，若每个都静默重试 12s，界面看起来
+# 就是「卡死」。真正的长等待交给调用方（如切版本的 60~90s 循环）。
+COM_RETRY_ATTEMPTS = 4
+COM_RETRY_DELAY = 1.0
+AO_RETRY_ATTEMPTS = 3
+AO_RETRY_DELAY = 1.0
+
 # 缓存的真实 Excel 实例：让本进程内所有 ExcelEngine 共享同一个 Excel，
 # 避免「ensure_excel_ready 建了一个专用实例、后续 ExcelEngine() 又连到另一个」。
 _active_excel = None
@@ -70,10 +78,20 @@ def _macro_timeout_sec() -> float:
 
 
 class ExcelEngine:
-    """Connects to the active Excel process (must already be running with AO)."""
+    """Connects to the active Excel process (must already be running with AO).
 
-    def __init__(self, timeout_sec: float = 30.0) -> None:
-        self._excel = self._connect(timeout_sec)
+    workbook_path：指定要绑定到「打开了这个文件的 Excel 实例」。Excel 可能同时
+    有多个进程（例如上一轮残留的无窗口实例 + 新开的导航表实例），Dispatch 只会
+    随机拿到其中一个——拿错实例时 find_workbook 永远找不到导航表，表现为
+    「等待导航表打开超时」。这时按文件路径从运行对象表（ROT）里精确绑定。
+    """
+
+    def __init__(self, timeout_sec: float = 30.0,
+                 workbook_path: Optional[str] = None,
+                 make_visible: bool = True) -> None:
+        self.workbook_path = workbook_path
+        self.make_visible = make_visible
+        self._excel = self._connect(timeout_sec, workbook_path, make_visible)
         # 记录本实例连接的是哪个 Excel 进程：断线恢复时只结束这个进程，
         # 不再无差别 taskkill 所有 EXCEL.EXE（避免杀掉用户其它未保存的工作簿）。
         self.pid = self._excel_pid(self._excel)
@@ -169,32 +187,167 @@ class ExcelEngine:
                 return xl
         return None
 
+    # ---------- 按文件路径绑定实例（多 Excel 进程时必需） ----------
+
     @staticmethod
-    def _connect(timeout: float):
+    def _rot_display_names() -> list[str]:
+        """运行对象表里所有已打开文档的显示名（形如完整文件路径）。
+
+        只枚举、不绑定：GetObject 一个没打开的路径会直接打开文件，
+        所以必须先确认它确实已在某个 Excel 实例里打开。
+        """
+        names: list[str] = []
+        try:
+            import pythoncom
+
+            rot = pythoncom.GetRunningObjectTable()
+            ctx = pythoncom.CreateBindCtx(0)
+            for moniker in rot.EnumRunning():
+                try:
+                    name = moniker.GetDisplayName(ctx, None)
+                except Exception:
+                    continue
+                if name:
+                    names.append(str(name))
+        except Exception as exc:
+            log.debug(f"枚举运行对象表失败（忽略）: {exc}")
+        return names
+
+    @classmethod
+    def _rot_workbook_path(cls, workbook_path: str) -> Optional[str]:
+        """在 ROT 中找这个文件的实际路径；没打开返回 None。"""
+        target = os.path.normcase(os.path.abspath(str(workbook_path)))
+        for name in cls._rot_display_names():
+            if not os.path.isabs(name):
+                continue
+            try:
+                if os.path.normcase(os.path.abspath(name)) == target:
+                    return name
+            except (OSError, ValueError):
+                continue
+        return None
+
+    @classmethod
+    def is_workbook_open(cls, workbook_path: str) -> bool:
+        """该文件当前是否已开在某个运行中的 Excel 里（只查 ROT，无副作用）。"""
+        return cls._rot_workbook_path(workbook_path) is not None
+
+    @classmethod
+    def _excel_from_rot(cls, workbook_path: str):
+        """绑定到打开了该文件的 Excel 实例；未打开或绑定失败返回 None。"""
+        display = cls._rot_workbook_path(workbook_path)
+        if display is None:
+            return None
+        try:
+            wb = win32com.client.GetObject(display)
+            xl = wb.Application
+        except Exception as exc:
+            log.debug(f"按路径绑定工作簿失败（稍后重试）: {exc}")
+            return None
+        if not cls._is_real_excel(xl):
+            return None
+        return xl
+
+    @staticmethod
+    def _connect(timeout: float, workbook_path: Optional[str] = None,
+                 make_visible: bool = True):
         global _active_excel
+        if workbook_path:
+            # 指定了工作簿：只认打开了它的实例。拿不到就报错让调用方轮询，
+            # 绝不回退到 Dispatch——那可能连上另一个空实例或把用户的 Excel 拿来做别的。
+            xl = ExcelEngine._excel_from_rot(workbook_path)
+            if xl is None:
+                raise ExcelError(
+                    f"工作簿未在运行中的 Excel 里打开（或暂时忙）：{workbook_path}")
+            if make_visible:
+                try:
+                    xl.Visible = True
+                except Exception:
+                    pass
+            _active_excel = xl
+            return xl
+
         # 已有缓存的真实 Excel → 直接复用（保证全流程操作同一个实例）
         if _active_excel is not None:
             try:
                 if ExcelEngine._is_real_excel(_active_excel):
+                    if make_visible:
+                        try:
+                            _active_excel.Visible = True
+                        except Exception:
+                            pass
                     return _active_excel
             except Exception:
                 pass
             _active_excel = None
 
         # 连接真实 Excel（复用运行中的，或启动一个专用实例）；短暂重试应对启动慢。
+        # 探测类调用（make_visible=False）绝不能把隐藏实例设为可见：现场里上一轮
+        # 被杀掉的空实例就藏在后台，Dispatch 连上它再 Visible=True，用户屏幕上
+        # 就会多出一个空白 Excel，和导航表并排出现。
         deadline = time.time() + min(timeout, 5.0)
         while time.time() < deadline:
             xl = ExcelEngine._dispatch_real_excel()
             if xl is not None:
-                try:
-                    xl.Visible = True
-                except Exception:
-                    pass
+                if make_visible:
+                    try:
+                        xl.Visible = True
+                    except Exception:
+                        pass
                 _active_excel = xl
                 return xl
             time.sleep(0.5)
         raise ExcelError("无法连接真实 Excel：相关 CLSID 均被 WPS 抢占。"
                          "请关闭 WPS 表格后重试，或修复 Office 的 COM 注册")
+
+    def ensure_visible(self) -> None:
+        """确保 Excel 主窗口可见；修不了就报错，绝不在不可见实例上继续。
+
+        AO 的登录框挂在 Excel 主窗口上：实例不可见（例如崩溃后残留的无窗口
+        进程）时登录框可能根本弹不出来，后台登录线程只会等到超时，表现为
+        "AO 没了"。宁可停下来让用户处理，也不要往一个看不见的 Excel 里写数据。
+        """
+        was_hidden = False
+        for _ in range(3):
+            try:
+                if not self._excel.Visible:
+                    was_hidden = True
+                    self._excel.Visible = True
+                if self._excel.Visible:
+                    if was_hidden:
+                        log.warning(
+                            f"检测到不可见的 Excel 实例（PID={self.pid}），已设为可见"
+                            "（AO 登录框需要可见窗口）")
+                    return
+            except Exception as exc:          # AO 忙时会抛 RPC_E_CALL_REJECTED
+                log.debug(f"设置 Excel 可见性失败（稍后重试）: {exc}")
+            time.sleep(1.0)
+        raise ExcelError(
+            f"Excel 实例（PID={self.pid}）处于不可见状态且无法恢复；"
+            "AO 登录框无法显示，继续运行会被误判为 AO 丢失。"
+            "请手动结束该 EXCEL.EXE 后重试")
+
+    def wait_ui_idle(self, timeout_sec: float = 120.0,
+                     poll_sec: float = 1.0) -> bool:
+        """等 Excel UI 线程空闲（登录后 AO 自动刷新会占住它几十秒）。
+
+        用普通 Excel 属性调用当屏障：UI 线程忙时调用会阻塞到刷新结束，或者被
+        拒（RPC_E_CALL_REJECTED）——被拒就重试。全程不调用 SAP* 宏，因为加载项
+        刷新期间任何 SAP* 调用都可能把它打崩（「加载项已断开所有数据源连接」）。
+        返回是否在超时前确认空闲。
+        """
+        from .cancel import raise_if_cancelled
+
+        deadline = time.time() + max(timeout_sec, 0.0)
+        while time.time() < deadline:
+            raise_if_cancelled()
+            try:
+                self._excel.Workbooks.Count
+                return True
+            except Exception as exc:
+                log.debug(f"等待 Excel UI 空闲：仍在忙（{exc}）")
+                time.sleep(max(poll_sec, 0.1))
+        return False
 
     # ---------- workbook lookup ----------
 
@@ -225,29 +378,76 @@ class ExcelEngine:
             raise ExcelError(f"未找到工作簿 '{pattern}'（等待 {wait_sec}s）: {exc}") from exc
 
     def open_sheet(self, wb: Any, sheet_name: str) -> Any:
-        for sh in wb.Worksheets:
+        try:
+            sheets = list(self._retry(lambda: wb.Worksheets))
+        except Exception as exc:
+            raise ExcelError(
+                f"读取 {self._safe_name(wb)} 的工作表失败: {exc}") from exc
+        for sh in sheets:
             if sh.Name == sheet_name:
                 return sh
-        names = [s.Name for s in wb.Worksheets]
+        names = [s.Name for s in sheets]
         raise ExcelError(f"No sheet '{sheet_name}' in {wb.Name}. Sheeets: {names}")
 
     # ---------- cell / range ----------
 
-    def read(self, sheet: Any, cell: str) -> Any:
+    @staticmethod
+    def _safe_name(sheet: Any) -> str:
+        """取工作表名；AO 忙时连 .Name 也会被拒，绝不能让它把原始 COM 异常带出去。"""
         try:
-            v = sheet.Range(cell).Value2
+            return str(sheet.Name)
+        except Exception:
+            return "?"
+
+    def read(self, sheet: Any, cell: str) -> Any:
+        name = self._safe_name(sheet)
+        try:
+            # AO 计算期间会抛 RPC_E_CALL_REJECTED（拒绝接收呼叫），重试即可；
+            # 以前不重试，忙碌中的 AO 会让整轮流程直接以裸 COM 异常中止。
+            v = self._retry(lambda: sheet.Range(cell).Value2,
+                            attempts=COM_RETRY_ATTEMPTS, delay=COM_RETRY_DELAY)
             # Excel COM often returns a tuple-of-tuples for a single cell too — unwrap
             if isinstance(v, tuple) and len(v) == 1 and isinstance(v[0], tuple):
                 v = v[0][0]
             return v
         except Exception as exc:
-            raise ExcelError(f"read {sheet.Name}!{cell}: {exc}") from exc
+            raise ExcelError(f"read {name}!{cell}: {exc}") from exc
 
     def write(self, sheet: Any, cell: str, value: Any) -> None:
+        name = self._safe_name(sheet)
         try:
-            sheet.Range(cell).Value2 = value
+            self._retry(lambda: setattr(sheet.Range(cell), "Value2", value),
+                        attempts=COM_RETRY_ATTEMPTS, delay=COM_RETRY_DELAY)
         except Exception as exc:
-            raise ExcelError(f"write {sheet.Name}!{cell}={value!r}: {exc}") from exc
+            raise ExcelError(f"write {name}!{cell}={value!r}: {exc}") from exc
+
+    def activate(self, wb: Any) -> None:
+        """激活工作簿；AO 忙时 wb.Activate() 同样会被拒绝，需要重试。"""
+        try:
+            self._retry(lambda: wb.Activate(),
+                        attempts=COM_RETRY_ATTEMPTS, delay=COM_RETRY_DELAY)
+        except Exception as exc:
+            raise ExcelError(f"activate {self._safe_name(wb)}: {exc}") from exc
+
+    def activate_sheet(self, sheet: Any) -> None:
+        name = self._safe_name(sheet)
+        try:
+            self._retry(lambda: sheet.Activate(),
+                        attempts=COM_RETRY_ATTEMPTS, delay=COM_RETRY_DELAY)
+        except Exception as exc:
+            raise ExcelError(f"activate sheet {name}: {exc}") from exc
+
+    def ao_call(self, function: str, *args) -> Any:
+        """调用 AO 的 Application.Run 宏（SAPSetVariable / SAPExecuteCommand 等）。
+
+        这类调用在 AO 刷新/计算期间经常抛 RPC_E_CALL_REJECTED，必须重试；
+        返回 AO 的原始结果（一般是 0/1 的 Long）。
+        """
+        try:
+            return self._retry(lambda: self._excel.Run(function, *args),
+                               attempts=AO_RETRY_ATTEMPTS, delay=AO_RETRY_DELAY)
+        except Exception as exc:
+            raise ExcelError(f"AO {function}{args}: {exc}") from exc
 
     def write_batch(self, sheet: Any, updates: dict[str, Any]) -> None:
         """Write many cells in one shot — one COM call per cell, but batched in Python."""
@@ -272,12 +472,13 @@ class ExcelEngine:
     # ---------- selection ----------
 
     def select(self, sheet: Any, cell: str) -> None:
+        name = self._safe_name(sheet)
         try:
             # ActiveSheet 是只读属性，只能通过 Activate 切换
-            sheet.Activate()
-            sheet.Range(cell).Select()
+            self._retry(lambda: (sheet.Activate(), sheet.Range(cell).Select()),
+                        attempts=COM_RETRY_ATTEMPTS, delay=COM_RETRY_DELAY)
         except Exception as exc:
-            raise ExcelError(f"select {sheet.Name}!{cell}: {exc}") from exc
+            raise ExcelError(f"select {name}!{cell}: {exc}") from exc
 
     # ---------- macros / AO automation ----------
 
@@ -446,7 +647,10 @@ class ExcelEngine:
             except ExcelError:
                 pass
         try:
-            return self._excel.Run("SAPExecuteCommand", "RefreshAll")
+            # AO 正在算上一轮时 RefreshAll 会被拒（RPC_E_CALL_REJECTED），先退避重试。
+            # 只重试 3 次：调用方（切版本循环/编排器）自己会再重试，静默久等反而像卡死。
+            return self._retry(lambda: self._excel.Run("SAPExecuteCommand", "RefreshAll"),
+                               attempts=AO_RETRY_ATTEMPTS, delay=AO_RETRY_DELAY)
         except Exception as exc:
             raise ExcelError(f"refresh failed: {exc}") from exc
 
@@ -538,10 +742,11 @@ class ExcelEngine:
         return True
 
     def workbook_names(self) -> list[str]:
-        return [wb.Name for wb in self._excel.Workbooks]
+        wbs = self._retry(lambda: list(self._excel.Workbooks))
+        return [wb.Name for wb in wbs]
 
     def workbook_count(self) -> int:
-        return self._excel.Workbooks.Count
+        return self._retry(lambda: self._excel.Workbooks.Count)
 
     def close_workbook(self, wb: Any, save: bool = False) -> None:
         """关闭工作簿。默认丢弃本地改动（数据已通过 Plan_Save 落入 BPC）。

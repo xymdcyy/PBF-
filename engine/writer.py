@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .cancel import raise_if_cancelled
 from .excel import ExcelEngine, ExcelError
 
 log = logging.getLogger(__name__)
@@ -74,6 +75,9 @@ class FormWriter:
         self._key_updates: dict[str, object] = {}
         self._new_rows: list[dict] = []
         self._blank_rows: Optional[list[int]] = None
+        self._last_data_row: Optional[int] = None
+        # 不同匹配列组合把同一个键指向不同行（键冲突，必须中止）
+        self._key_conflicts: list[tuple[str, int, int, str]] = []
         # measure_blocks：按表头动态识别出来的 {度量: {期间: 列}}（每次 preflight 重置）
         self._measure_map: Optional[dict[str, dict[str, str]]] = None
 
@@ -253,6 +257,27 @@ class FormWriter:
 
     # ---------- preflight ----------
 
+    def _key_match_patterns(self) -> list[list[str]]:
+        """组合键的匹配列组合。
+
+        第一组是 `key_columns`；`key_match_columns` 可再给若干组同长度的列组合，
+        让同一个数据键能匹配到不同显示列。例如价格表的数据源「产品」可能是
+        产品成员（AD）或客户型号（AF），两种都要能命中已有行。
+        """
+        key_cols = self.cfg.get("key_columns") or []
+        if not key_cols:
+            return []
+        primary = [k["column"] for k in key_cols]
+        patterns = [primary]
+        for pat in self.cfg.get("key_match_columns") or []:
+            pat = [str(c).strip().upper() for c in pat]
+            if len(pat) != len(primary):
+                raise ExcelError(
+                    f"key_match_columns 列数({len(pat)})与 key_columns({len(primary)})不一致：{pat}")
+            if pat not in patterns:
+                patterns.append(pat)
+        return patterns
+
     def _build_row_index(self, sheet) -> dict[str, int]:
         """扫描数据区，返回 {组合键: 行号}。simple 用单科目列，keyed 用组合键。"""
         cfg = self.cfg
@@ -260,16 +285,25 @@ class FormWriter:
         start, end = input_rows[0], input_rows[-1]
         skip_rows = set(cfg.get("skip_rows", []))
         index: dict[str, int] = {}
+        self._key_conflicts = []
 
         key_cols = cfg.get("key_columns")
         if key_cols:
-            cols = [k["column"] for k in key_cols]
+            patterns = self._key_match_patterns()
             for r in range(start, end + 1):
                 if r in skip_rows:
                     continue
-                vals = [self.engine.read(sheet, f"{c}{r}") for c in cols]
-                key = "|".join("" if v is None else str(v).strip() for v in vals)
-                if key.strip("|") and key not in index:
+                # 主组合键优先；别名字段只补空缺，避免覆盖主键命中的行。
+                for i, cols in enumerate(patterns):
+                    vals = [self.engine.read(sheet, f"{c}{r}") for c in cols]
+                    key = "|".join("" if v is None else str(v).strip() for v in vals)
+                    if not key.strip("|"):
+                        continue
+                    if key in index:
+                        if index[key] != r:
+                            self._key_conflicts.append(
+                                (key, index[key], r, "+".join(cols)))
+                        continue
                     index[key] = r
             return index
 
@@ -316,25 +350,81 @@ class FormWriter:
             return self._key_columns()
         return [self.cfg.get("item_column", "P")]
 
+    def _format_sig(self, sheet, row: int) -> Optional[tuple[str, ...]]:
+        """数据行的格式指纹（维度列 + 第一个度量列）。
+
+        AO 查询结果行有模板定义的数值格式；查询区之后残留的模板行通常是
+        文本格式（`@`）。拿不到格式（例如测试桩/无 COM）时返回 None，
+        表示无法判断，沿用旧行为。
+        """
+        cells = [f"{c}{row}" for c in self._key_columns()]
+        measures = self._measure_map or self.cfg.get("measures") or {}
+        for cols in measures.values():
+            if cols:
+                first = next(iter(cols.values()))
+                cells.append(f"{first}{row}")
+                break
+        if len(cells) == len(self._key_columns()):
+            month_cols = self.cfg.get("month_columns") or {}
+            if month_cols:
+                cells.append(f"{next(iter(month_cols.values()))}{row}")
+        try:
+            return tuple(str(sheet.Range(c).NumberFormat) for c in cells)
+        except Exception:
+            return None
+
     def _blank_row_pool(self, sheet) -> list[int]:
         if self._blank_rows is not None:
             return self._blank_rows
+        append = bool(self.cfg.get("append_rows"))
+        if self.cfg.get("allow_new_rows", True) is False and not append:
+            self._blank_rows = []
+            log.info("本表配置禁止自动新增行（allow_new_rows: false）")
+            return []
         start, end = (self.cfg.get("input_rows") or [1, 100])[:2]
         skip = set(self.cfg.get("skip_rows", []))
         cols = self._blank_check_columns()
         rows: list[int] = []
+        last_data_row: Optional[int] = None
+        dropped = 0
         for r in range(start, end + 1):
             if r in skip:
                 continue
-            if all(_is_empty(self.engine.read(sheet, f"{c}{r}")) for c in cols):
-                rows.append(r)
+            if not all(_is_empty(self.engine.read(sheet, f"{c}{r}")) for c in cols):
+                last_data_row = r
+                continue
+            if append:
+                # append_rows：只在表尾追加，不占用查询区中间的空行
+                continue
+            # 新增行必须在 AO 数据区格式内：以上方最近一条数据行为基准，
+            # 格式不一致的是查询区之外的模板残留行。
+            if last_data_row is not None:
+                ref_sig = self._format_sig(sheet, last_data_row)
+                sig = self._format_sig(sheet, r)
+                if ref_sig is not None and sig is not None and sig != ref_sig:
+                    dropped += 1
+                    continue
+            rows.append(r)
+        self._last_data_row = last_data_row
+        if append and last_data_row is not None:
+            # 2026-11-24 实测：在 AO 查询结果最后一行下方写入新维度组合，
+            # Plan_Save 保存后关闭重开仍在（原以为会被查询丢弃，实际可以）。
+            row = last_data_row + 1
+            if (row <= end and row not in skip
+                    and all(_is_empty(self.engine.read(sheet, f"{c}{row}")) for c in cols)):
+                rows.append(row)
+                log.info(f"表尾追加行 {row}（最后数据行 {last_data_row}）")
+            else:
+                log.warning(f"最后数据行 {last_data_row} 下方第 {row} 行不可追加")
         self._blank_rows = rows
-        log.info(f"表单空白可新增行 {len(rows)} 行（{start}-{end}）")
+        extra = f"，跳过格式不一致的模板残留行 {dropped} 行" if dropped else ""
+        log.info(f"表单空白可新增行 {len(rows)} 行（{start}-{end}）{extra}")
         return rows
 
     def _row_for_key(self, sheet, row_index: dict[str, int], key: str,
-                     key_values: Optional[dict[str, str]] = None) -> Optional[int]:
-        """已有组合键返回原行；否则取第一条空白行，登记维度写入（先维度后数据）。"""
+                     key_values: Optional[dict[str, str]] = None,
+                     extra_values: Optional[dict[str, str]] = None) -> Optional[int]:
+        """已有组合键返回原行；否则取一条空白行，登记维度写入（先维度后数据）。"""
         if key in row_index:
             return row_index[key]
         if not key:
@@ -343,7 +433,9 @@ class FormWriter:
         if not rows:
             return None
         row = rows.pop(0)
-        values = key_values or {}
+        values = dict(key_values or {})
+        for col, value in (extra_values or {}).items():
+            values.setdefault(col, value)
         for col, value in values.items():
             if _is_empty(value):
                 continue
@@ -352,6 +444,42 @@ class FormWriter:
         self._new_rows.append({"row": row, "key": key, "key_values": dict(values)})
         log.info(f"新增行 {row}: {key}")
         return row
+
+    def _copied_dims(self, sheet, row: dict) -> tuple[dict[str, str], str]:
+        """新行缺少的维度（如产品型号/客户型号）从同产品的既有行复制。
+
+        价格表只匹配 组织/渠道/品牌/产品 四维；AO 保存新组合时 AE 产品型号、
+        AF 客户型号、AG 产品型号状态 也必须有值（手工新增行时用户就是这么
+        填的）。这些是产品属性，与渠道无关，可从同产品的任意既有行复制。
+        未配置时返回 ({}, "")；找不到可复制的行时返回 ("", 原因)。
+        """
+        spec = self.cfg.get("new_row_copy") or {}
+        cols = [str(c).strip().upper() for c in (spec.get("columns") or [])]
+        match_col = str(spec.get("match_column") or "").strip().upper()
+        if not cols or not match_col:
+            return {}, ""
+        names = {str(k.get("column", "")).strip().upper(): k.get("name")
+                 for k in self.cfg.get("key_columns") or []}
+        value = self._dim(row, names.get(match_col) or "")
+        if not value:
+            return {}, f"缺少可复制维度 {match_col} 的值"
+        start, end = (self.cfg.get("input_rows") or [1, 100])[:2]
+        skip = set(self.cfg.get("skip_rows", []))
+        for r in range(start, end + 1):
+            if r in skip:
+                continue
+            got = str(self.engine.read(sheet, f"{match_col}{r}") or "").strip()
+            if got != value:
+                continue
+            vals = {c: str(self.engine.read(sheet, f"{c}{r}") or "").strip()
+                    for c in cols}
+            missing = [c for c, v in vals.items() if not v]
+            if missing:
+                log.debug(f"同产品行 {r} 的 {missing} 为空，继续找其它行")
+                continue
+            log.info(f"新增行维度复制自第 {r} 行（{match_col}={value}）：{vals}")
+            return vals, ""
+        return {}, f"无同产品行可复制维度 {'/'.join(cols)}"
 
     # ---------- 期间覆盖 ----------
 
@@ -392,6 +520,8 @@ class FormWriter:
         self._key_updates = {}
         self._new_rows = []
         self._blank_rows = None
+        self._last_data_row = None
+        self._key_conflicts = []
         self._measure_map = None
         result.checks.append(("workbook", True, f"{wb.Name}"))
 
@@ -446,6 +576,12 @@ class FormWriter:
         result.new_rows = list(self._new_rows)
         detail = f"key={'+'.join(k['name'] for k in key_cols)}" if key_cols else "item_column"
         result.checks.append(("行匹配", True, f"{detail}, 命中 {len(matched)} 格"))
+        if self._key_conflicts:
+            sample = "；".join(
+                f"{k} → 行{a}/{b}（{cols}）" for k, a, b, cols in self._key_conflicts[:3])
+            result.checks.append((
+                "键冲突", False,
+                f"{len(self._key_conflicts)} 个键在不同匹配列组合下指向不同行：{sample}"))
         if result.new_rows:
             result.checks.append((
                 "新增行", True,
@@ -641,7 +777,12 @@ class FormWriter:
                 if not key or any(not v for v in key_values.values()):
                     skipped.append(f"{label} [维度缺失]")
                     continue
-                target_row = self._row_for_key(sheet, row_index, key, key_values)
+                copy_values, copy_err = self._copied_dims(sheet, row)
+                if copy_err:
+                    skipped.append(f"{label} [{copy_err}]")
+                    continue
+                target_row = self._row_for_key(sheet, row_index, key, key_values,
+                                               extra_values=copy_values)
                 if target_row is None:
                     skipped.append(f"{label} [无空白行]")
                     continue
@@ -831,6 +972,7 @@ class FormWriter:
         if not preflight.ok:
             raise ExcelError(f"Preflight failed (or no values to write)")
 
+        raise_if_cancelled()               # 安全点：还没动任何单元格
         wb, sheet = self._resolve(wait_open=False)
         mac = self.cfg.get("macros", {})
         result = {"written": 0, "saved": False, "verified": False, "failures": []}
@@ -852,6 +994,7 @@ class FormWriter:
         # AO 会按这些维度校验后面写入的月度数据。顺序反了可能被丢弃或串行。
         key_updates = dict(getattr(preflight, "key_updates", {}) or {})
         if key_updates:
+            raise_if_cancelled()           # 安全点：写入前最后检查
             log.info(f"先写维度 {len(key_updates)} 格（新增行）")
             try:
                 self.engine.write_batch(sheet, key_updates)
@@ -861,6 +1004,7 @@ class FormWriter:
                 return result
             time.sleep(2.0)                      # 让 AO 完成维度校验再写数值
 
+        raise_if_cancelled()               # 安全点：数值写入前最后检查
         log.info(f"Writing {len(updates)} cells into {wb.Name}")
         try:
             self.engine.write_batch(sheet, updates)
@@ -870,6 +1014,8 @@ class FormWriter:
             return result
 
         # 2. save
+        # 取消发生在这里 → 不保存，BPC 里仍是旧数据；上层会关闭工作簿丢弃本地改动
+        raise_if_cancelled()
         result["cells"] = {row["cell"]: row["new_value"] for row in preflight.matched_rows}
         save_macro = mac.get("save")
         try:

@@ -56,18 +56,49 @@ class RunRegistry:
             self._runs.pop(rid, None)
 
 
-def should_hold_slot(state: dict, proc_alive: bool, excel_running: bool) -> bool:
+def run_owned_pids(state: dict, current_pids) -> set[int]:
+    """本次运行"拥有"的 Excel PID：运行开始时不在、结束时还在的那些。
+
+    之前只要有任何 EXCEL.EXE 就占槽，把用户自己开的 Excel（甚至别的 COM
+    客户端开的）也算进来，逼着用户关掉唯一带 AO 会话的实例，反而毁掉会话。
+    归属记录里的 pbf 实例（跨进程持久化）也一并计入。
+    """
+    if current_pids is None:
+        return set()
+    current = {int(p) for p in current_pids}
+    baseline = {int(p) for p in (state.get("excel_pids_before") or [])}
+    owned = {int(p) for p in (state.get("excel_owned_pids") or [])}
+    owned |= current - baseline
+    return current & owned
+
+
+def should_hold_slot(state: dict, proc_alive: bool, current_pids=None) -> bool:
     """取消/超时后是否继续占用运行槽位。
 
-    占位的目的：子进程没被确认终止，或 COM 启动的 Excel 还在跑（它不属于
-    子进程树，taskkill /T 杀不到），此时放行新流程会出现两个流程操作同一
-    个 Excel。子进程确认死亡、Excel 也退出后才放行。
+    占位的目的：子进程没被确认终止，或**本次运行启动的** Excel 可能还在执行
+    宏（COM 调用在服务端继续跑，taskkill /T 杀不到），此时放行新流程会出现
+    两个流程操作同一个 Excel。
+
+    - 子进程还活着 → 占位。
+    - 正常结束 → 放行。
+    - 取消后子进程已在安全点自行退出（cancel_graceful）→ 放行：此时 Excel
+      可能还开着导航表，下一轮直接复用即可。
+    - 硬取消/超时 → 只等本次运行启动的 Excel 退出；用户原有的 Excel 不占槽。
     """
     if proc_alive:
         return True
-    if state.get("timed_out") or state.get("cancelled"):
-        return excel_running
-    return False
+    if not (state.get("timed_out") or state.get("cancelled")):
+        return False
+    if state.get("cancel_package_running"):
+        # 运行包已在 BPC 后台触发，取消只让工具不再等待；它可能仍在执行。
+        # 无法从本地探测执行进度，保守占位，由用户确认后「强制释放槽位」。
+        return True
+    if state.get("cancel_graceful"):
+        return False
+    if current_pids is None:
+        # 无法枚举进程：宁可多占一会儿，也不能让两个流程同时操作 Excel
+        return True
+    return bool(run_owned_pids(state, current_pids))
 
 
 def can_force_release(state: dict, proc_alive: bool) -> bool:

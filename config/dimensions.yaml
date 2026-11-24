@@ -26,6 +26,25 @@ navigator:
   version_display_cell: "AR45"
   version_context_cell: "C20"
   version_member_cell: "F20"
+  # 切版本后等待 AO 生效的总时长（秒）。AO 刚登录时服务端会话未就绪，
+  # 写入的版本变量可能被初始化覆盖、RefreshAll 可能被拒；此期间会
+  # 反复「重写 C20/F20 + 设置 AO 版本过滤器 + 刷新」，直到 AR45 显示目标版本。
+  version_switch_timeout_sec: 60
+  # 登录 AO 后它会先自动刷新一遍；先等 AR45 有值再开始切版本，
+  # 避免十几个 AO 调用全在重试（界面上看起来像卡死）。
+  ao_ready_timeout_sec: 45
+  # 登录框关闭后加载项会占住 Excel UI 线程自动刷新数据源（30s 级）。
+  # 切版本前用普通 Excel 调用当空闲屏障，等刷新收尾（空闲时立即返回）；
+  # 刷新期间调 SAPSetVariable 会把加载项打崩（「已断开所有数据源连接」）。
+  ao_idle_timeout_sec: 30
+  # 真正切版本：把目标版本写进 DS_PROCESSLIST 的提示变量再刷新，等价于
+  # 选好版本后点「刷新状态」（导航表 VBA Refresh_Status）。只写 C20/F20 +
+  # RefreshAll 不会切版本——AO 回显会把 C20 抄回旧值，AR45 永远不变。
+  version_data_provider: "DS_PROCESSLIST"
+  version_prompt_key_var: "ZCCSO_ZDCATEGRY_010"
+  # Refresh_Status 同时把 C19（期间）写进期间提示变量；C03 版本时 C19 为空。
+  version_prompt_time_var: "ZCCSO_ZDTIME_048"
+  version_time_cell: "C19"
   # Macro names on navigator workbook
   refresh_macro: null   # Use generic RefreshAll
 

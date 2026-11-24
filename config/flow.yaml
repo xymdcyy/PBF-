@@ -13,6 +13,16 @@ login:
   client: "333"
   lang: zh
   timeout: 60
+  # 新开 Excel 后多久没出现 AO 登录框，就按"已用缓存凭据登录"继续。
+  # 已登录时 AO 根本不弹框；空等满 timeout 会把正常会话误报成登录失败。
+  no_box_ok_sec: 30
+  # 复用已打开的 Excel 时守候登录框的时长（登录框约 10s 才弹）
+  reuse_wait_sec: 15
+  # 登录框关闭后 AO 会自动刷新所有数据源（实测占住 Excel 几十秒）。这期间
+  # 调 SAPSetVariable 会把加载项打崩（「SAP BI 加载项已断开所有数据源连接」），
+  # 所以先等 settle_start_sec，再用 Excel 空闲屏障最多等 idle_timeout_sec。
+  settle_start_sec: 5
+  idle_timeout_sec: 120
 
 # ---------- 故障自动恢复 ----------
 # Excel/AO 偶发闪退时，自动重开导航表 + 重新登录，并把失败的步骤重做一次

@@ -210,6 +210,21 @@ def check_form_config(form_id: str, cfg: dict) -> list[Issue]:
                 issues.append(_err(f"{form_id}: key_columns 列号异常 {k!r}"))
             if not str(k.get("name", "")).strip():
                 issues.append(_err(f"{form_id}: key_columns 缺少 name {k!r}"))
+
+        # 额外匹配列组合：维度个数必须与 key_columns 一致，列号必须是合法列
+        for pat in cfg.get("key_match_columns") or []:
+            if not isinstance(pat, list):
+                issues.append(_err(
+                    f"{form_id}: key_match_columns 每项应为列号列表，收到 {pat!r}"))
+                continue
+            if len(pat) != len(key_cols):
+                issues.append(_err(
+                    f"{form_id}: key_match_columns 列数 {len(pat)} 与 "
+                    f"key_columns {len(key_cols)} 不一致：{pat}"))
+            for col in pat:
+                if not COL_RE.match(str(col).strip().upper()):
+                    issues.append(_err(
+                        f"{form_id}: key_match_columns 列号异常 {col!r}"))
     if layout == "simple" and not cfg.get("item_column"):
         issues.append(_err(f"{form_id}: simple 布局缺少 item_column"))
     if layout == "measure_blocks" and not cfg.get("measures"):

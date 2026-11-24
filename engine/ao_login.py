@@ -155,16 +155,22 @@ class AoLogin:
 
     # ---------- 主流程 ----------
 
-    def ensure(self, timeout: float = 60.0, expect_login: bool = False) -> bool:
+    def ensure(self, timeout: float = 60.0, expect_login: bool = False,
+               no_box_ok_after: float | None = None, max_attempts: int = 1) -> bool:
         """确保已登录。返回 True=已登录/无需登录，False=超时仍停留在登录框。
 
         - expect_login=False（默认）：若整个轮询期间从未出现登录框，判定已用缓存凭据
           登录并尽快返回 True（避免已登录时白等）。
-        - expect_login=True：登录框必然会出现（打开导航表后 AO 要加载 ~10s 才弹框），
-          必须等到它出现并填掉，不能提前判定已登录。
+        - expect_login=True：打开导航表后 AO 要加载 ~10s 才弹框，必须等它出现并填掉。
+          但如果 `no_box_ok_after` 秒后仍没有框，按"已用缓存凭据登录"继续——
+          空等满 60s 再报"AO 自动登录失败"是把正常缓存会话当成故障。
+        - max_attempts：自动填账号密码的最多次数（默认 1）。登录框反复不消失时
+          不再自动重试：凭据被拒时反复提交有账号锁定风险，应交用户手动登录。
         """
-        deadline = time.time() + timeout
+        started = time.time()
+        deadline = started + timeout
         saw_login = False
+        attempts = 0
 
         while time.time() < deadline:
             try:
@@ -176,7 +182,13 @@ class AoLogin:
                 if self._find_login(0.5):
                     saw_login = True
                     self.saw_login_box = True
-                    log.info("检测到 AO 登录框，开始自动登录")
+                    if attempts >= max_attempts:
+                        log.error(
+                            "AO 登录框仍在（已自动尝试 %d 次）：为避免账号锁定，"
+                            "不再自动重试。请在 Excel 中手动登录后重试", attempts)
+                        return False
+                    attempts += 1
+                    log.info(f"检测到 AO 登录框，开始自动登录（第 {attempts} 次）")
                     self._fill_and_submit()
                     time.sleep(5)
 
@@ -187,7 +199,7 @@ class AoLogin:
                     if not self._find_login(0.5):
                         log.info("登录成功")
                         return True
-                    log.warning("登录框仍在，重试")
+                    log.warning("登录框仍在（第 %d 次尝试未成功）", attempts)
                     continue
 
                 # 没检测到登录框
@@ -196,12 +208,19 @@ class AoLogin:
                     log.info("登录框已消失，登录成功")
                     return True
 
-                # 从未出现过登录框：仅当不要求登录框出现时，才允许提前判定已登录
+                # 从未出现过登录框
                 if not expect_login:
                     time.sleep(2)
                     if not self._find_login(0.5):
                         log.info("未出现登录框，判定已登录")
                         return True
+                elif no_box_ok_after is not None \
+                        and time.time() - started >= no_box_ok_after:
+                    log.warning(
+                        "启动后 %.0fs 内未检测到 AO 登录框，按已用缓存凭据登录继续；"
+                        "若后续操作卡在登录框，请在 Excel 中手动登录后重试",
+                        no_box_ok_after)
+                    return True
             except Exception as exc:      # UIA 偶发 COMError，忽略后继续轮询
                 log.debug(f"登录轮询异常（忽略并重试）: {exc}")
 

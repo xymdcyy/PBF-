@@ -23,7 +23,8 @@ import pandas as pd
 import yaml
 
 from .excel import ExcelEngine, ExcelError, is_disconnect
-from .bootstrap import ensure_excel_ready
+from .bootstrap import ensure_excel_ready, launch_no_box_ok_sec
+from .cancel import CancelledError, is_cancelled, raise_if_cancelled
 from .header_periods import normalize_period_header
 from .navigator import Navigator
 from .writer import FormWriter
@@ -433,15 +434,18 @@ class PbfFlow:
         if login_cfg.get("username") and not login_confirmed:
             from .ao_login import AoLogin
 
+            launched = bool(getattr(self.engine, "launched_now", False))
             ok = AoLogin(
                 username=login_cfg["username"],
                 password=login_cfg.get("password", ""),
                 client=str(login_cfg.get("client", "333")),
                 lang=str(login_cfg.get("lang", "zh")),
             ).ensure(float(login_cfg.get("timeout", 120)),
-                     expect_login=bool(getattr(self.engine, "launched_now", False)))
+                     expect_login=launched,
+                     no_box_ok_after=launch_no_box_ok_sec(self.cfg) if launched else None)
             if not ok:
-                log.error("恢复后自动登录失败")
+                log.error("恢复后自动登录失败（已停止自动重试，避免账号锁定），"
+                          "请在 Excel 中手动登录后重试")
                 return False
         elif login_confirmed:
             log.info("启动阶段已处理 AO 登录，恢复流程跳过重复登录")
@@ -714,6 +718,7 @@ class PbfFlow:
     # ---------- 填表 ----------
 
     def fill_form(self, step: dict) -> dict:
+        raise_if_cancelled()               # 安全点：还没打开表单就取消，零副作用
         form_id = step["form"]
         cfg = self.form_cfgs[form_id]
         pattern = cfg["workbook_pattern"]
@@ -741,6 +746,8 @@ class PbfFlow:
                 failed.append(f"未匹配科目: {pf.skipped[:5]}")
             raise ExcelError(f"{form_id} preflight 未通过 — " + "；".join(failed or ["无命中"]))
         log.info(f"{form_id}: 命中 {len(pf.matched_rows)} 格")
+        # 安全点：preflight 完成后、真正写入 BPC 之前
+        raise_if_cancelled()
         res = writer.write_and_save(pf, verify_after=False)
         if not res.get("saved"):
             return res
@@ -765,6 +772,7 @@ class PbfFlow:
         返回不一致项列表（空列表 = 全部通过）。可用 flow.yaml 的
         `verify_writeback.sample` 抽样加速；默认全量，一次 600 格的读回约几秒。
         """
+        raise_if_cancelled()               # 安全点：数据已保存，取消后不再读回
         cfg = self.form_cfgs[form_id]
         pattern = cfg["workbook_pattern"]
         items = list(cells.items())
@@ -784,7 +792,9 @@ class PbfFlow:
         ws = self.engine.open_sheet(wb, cfg["sheet"])
 
         failures: list[str] = []
-        for cell, expected in items:
+        for n, (cell, expected) in enumerate(items):
+            if n and n % 100 == 0:
+                raise_if_cancelled()       # 全量读回时也给取消留检查点
             actual = self._read(ws, cell)
             if _blank(expected) and _blank(actual):
                 continue
@@ -877,6 +887,7 @@ class PbfFlow:
                 "已关闭清单、未执行任何宏，请核对后重试")
         log.info(f"运行包: {step_name} | 版本: {version}")
 
+        raise_if_cancelled()               # 安全点：还没触发运行包，取消无副作用
         self.engine.run_macro(self.pkg_cfg["execute_macro"], wb)
         log.info("已触发执行，等待完成…")
 
@@ -886,6 +897,10 @@ class PbfFlow:
         deadline = time.time() + self.pkg_cfg["max_wait_sec"]
         while time.time() < deadline:
             time.sleep(self.pkg_cfg["poll_interval_sec"])
+            if is_cancelled():
+                # 运行包已在后台执行：这里只是不再等它，不能假装它被撤销
+                raise CancelledError(
+                    f"已取消（运行包「{step_name}」已在后台触发，可能仍会执行完成）")
             try:
                 # Refresh_Sheet 会重算/重建 AO 对象，旧的 wb/ws 可能失效；
                 # 每次刷新前后都按名字重新绑定，避免读到断开的 COM 引用。
@@ -918,6 +933,7 @@ class PbfFlow:
         allow_all_zero=True 用于「清 0」流程：目标期间本来就被清成全 0，
         指标全 0 是预期结果，只告警不报错（否则清 0 会被误判为运行包没生效）。
         """
+        raise_if_cancelled()
         self.indicators_all_zero = False
         vcfg = self.cfg["verify"]
         self.ensure_navigator_version()
@@ -1114,6 +1130,46 @@ class PbfFlow:
 
 # ---------- CLI 入口 ----------
 
+def close_form_workbooks_on_cancel(engine: ExcelEngine, form_cfgs: dict,
+                                   flow_cfg: dict) -> list[str]:
+    """取消收尾：关闭本工具打开的表单/运行包工作簿（不保存），返回关闭的名字。
+
+    只匹配配置里的 workbook_pattern：导航表和用户自己打开的工作簿一律不碰。
+    关闭时丢弃本地改动——取消点若在 Plan_Save 之前，BPC 里本来就没有这些值；
+    若在之后，数据已经保存，丢弃本地副本也没有影响。
+    """
+    patterns: list[str] = []
+    for cfg in form_cfgs.values():
+        pat = cfg.get("workbook_pattern")
+        if pat:
+            patterns.append(str(pat))
+    pkg = flow_cfg.get("package") or {}
+    if pkg.get("workbook_pattern"):
+        patterns.append(str(pkg["workbook_pattern"]))
+    if not patterns or engine is None:
+        return []
+    try:
+        names = engine.workbook_names()
+    except Exception as exc:
+        log.warning(f"取消收尾：无法枚举工作簿（{exc}），请确认 Excel 中没有未保存的表单")
+        return []
+    closed: list[str] = []
+    for name in names:
+        if "导航" in name:
+            continue
+        if not any(fnmatch.fnmatchcase(name, pat) for pat in patterns):
+            continue
+        try:
+            wb = engine.find_workbook(name)
+            engine.close_workbook(wb, save=False)
+            closed.append(name)
+        except Exception as exc:
+            log.warning(f"取消收尾：关闭 {name} 失败（忽略）: {exc}")
+    if closed:
+        log.warning(f"已按取消请求关闭未完成的工作簿（不保存）：{closed}")
+    return closed
+
+
 def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Path,
              skip_fill: bool = False, only_verify: bool = False,
              expected_version: Optional[str] = None,
@@ -1169,18 +1225,24 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
                 # 继续跑只会把清晰的报错变成 COM 挂死
                 raise ExcelError(
                     f"AO 自动登录失败（{handle.error or '超时或密码错误'}），"
-                    "登录框可能仍在——请手动登录后重试")
+                    "登录框可能仍在——为避免账号锁定，工具不会自动重试；"
+                    "请在 Excel 中手动登录后重试")
             from .ao_login import AoLogin
+            launched = bool(getattr(engine, "launched_now", False))
             ok = AoLogin(
                 username=login_cfg["username"],
                 password=login_cfg.get("password", ""),
                 client=str(login_cfg.get("client", "333")),
                 lang=str(login_cfg.get("lang", "zh")),
             ).ensure(float(login_cfg.get("timeout", 60)),
-                     # 刚由本工具启动 Excel 时，登录框还没弹出来，必须等它出现
-                     expect_login=bool(getattr(engine, "launched_now", False)))
+                     # 刚由本工具启动 Excel 时，登录框还没弹出来，必须等它出现；
+                     # 但超过登录宽限仍没有框时按缓存会话继续，不再空等到超时
+                     expect_login=launched,
+                     no_box_ok_after=launch_no_box_ok_sec(flow_cfg) if launched else None)
             if not ok:
-                raise ExcelError("AO 自动登录失败，请手动登录后重试")
+                raise ExcelError(
+                    "AO 自动登录失败（已停止自动重试，避免账号锁定），"
+                    "请在 Excel 中手动登录后重试")
             report["login"] = True
 
     rcfg = flow_cfg.get("recovery") or {}
@@ -1195,6 +1257,10 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
             try:
                 return fn()
             except Exception as exc:            # 包含未包装的 com_error
+                if isinstance(exc, CancelledError):
+                    # 取消不是故障：不重试、不走恢复，直接把工作簿留在
+                    # "未保存"状态交给上层收尾
+                    raise
                 del report["steps"][steps_len:]      # 丢掉这次重试前的半成品记录
                 del report["packages"][pkgs_len:]
                 # 会话失效有两个来源：已翻译成 SessionExpiredError 的，和
@@ -1304,6 +1370,7 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
         return report
 
     for i, step in enumerate(steps):
+        raise_if_cancelled()               # 安全点：取消后不再开始新表单
         form_id = step["form"]
         if i < start_idx:
             log.info(f"跳过步骤 {i + 1}（{form_id}）")

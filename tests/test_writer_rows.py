@@ -34,6 +34,10 @@ class FakeRange:
         return types.SimpleNamespace(Color=color)
 
     @property
+    def NumberFormat(self):
+        return self.sheet.formats.get(self.addr, self.sheet.default_format)
+
+    @property
     def Value2(self):
         if ":" not in self.addr:
             return self.sheet.cells.get(self.addr)
@@ -66,10 +70,14 @@ def _col_index(addr: str) -> int:
 
 class FakeSheet:
     def __init__(self, cells: dict, color: int = WHITE,
-                 colors: dict[str, int] | None = None) -> None:
+                 colors: dict[str, int] | None = None,
+                 formats: dict[str, str] | None = None,
+                 default_format: str = "G/通用格式") -> None:
         self.cells = dict(cells)
         self.color = color
         self.colors = dict(colors or {})
+        self.formats = dict(formats or {})
+        self.default_format = default_format
         used = [_col_index(a) for a in self.cells]
         first, last = (min(used), max(used)) if used else (1, 1)
         self.UsedRange = types.SimpleNamespace(
@@ -288,6 +296,78 @@ class WriterNewRowTests(unittest.TestCase):
         self.assertEqual(list(second.key_updates), ["AA57", "AB57"])
         self.assertEqual(len(second.new_rows), 1)
 
+    def test_alias_columns_match_existing_row(self) -> None:
+        # 价格表数据源的「产品」可能是客户型号（AF），而主键是产品成员（AD）；
+        # 别名列组合应让这类数据命中已有行，而不是被当成新行。
+        cfg = {**KEYED_CFG, "key_match_columns": [["AA", "AB"], ["AA", "AC"]]}
+        sheet = FakeSheet({"AA57": "A", "AC57": "X", "AI57": 1})
+        engine = FakeEngine(sheet=sheet)
+        writer = FormWriter(engine, cfg)
+        pf = writer.preflight([{"组织": "A", "科目": "X", "2027.01": 5}])
+        self.assertTrue(pf.ok, pf.checks)
+        self.assertEqual(pf.matched_rows[0]["cell"], "AI57")
+        self.assertEqual(pf.new_rows, [])
+
+    def test_alias_key_conflict_aborts_preflight(self) -> None:
+        # 同一个键通过不同列组合指向两行 → 不能猜，必须中止
+        cfg = {**KEYED_CFG, "key_match_columns": [["AA", "AB"], ["AA", "AC"]]}
+        sheet = FakeSheet({
+            "AA57": "A", "AB57": "X", "AI57": 1,
+            "AA58": "A", "AC58": "X", "AI58": 2,
+        })
+        engine = FakeEngine(sheet=sheet)
+        writer = FormWriter(engine, cfg)
+        pf = writer.preflight([{"组织": "A", "科目": "X", "2027.01": 5}])
+        self.assertFalse(pf.ok)
+        check = {name: (ok, detail) for name, ok, detail in pf.checks}
+        self.assertIn("键冲突", check)
+        self.assertFalse(check["键冲突"][0])
+
+    def test_allow_new_rows_false_skips_unmatched_key(self) -> None:
+        cfg = {**KEYED_CFG, "allow_new_rows": False}
+        writer = FormWriter(FakeEngine(), cfg)
+        pf = writer.preflight([{"组织": "A", "科目": "X", "2027.01": 5}])
+        self.assertFalse(pf.ok)
+        self.assertEqual(pf.new_rows, [])
+        self.assertEqual(pf.key_updates, {})
+        self.assertIn("无空白行", " ".join(pf.skipped))
+
+    def test_blank_rows_with_template_format_are_not_usable(self) -> None:
+        # 未开 append_rows 时，查询区之外文本格式的模板行仍不算空白行
+        cells = {"AA57": "A", "AB57": "X", "AI57": 1}
+        formats = {"AA57": "G/通用格式", "AB57": "G/通用格式", "AI57": "0.00"}
+        sheet = FakeSheet(cells, formats=formats, default_format="@")
+        engine = FakeEngine(sheet=sheet)
+        writer = FormWriter(engine, {**KEYED_CFG, "input_rows": [57, 58]})
+        pf = writer.preflight([{"组织": "B", "科目": "Y", "2027.01": 5}])
+        self.assertFalse(pf.ok)
+        self.assertEqual(pf.new_rows, [])
+        self.assertIn("无空白行", " ".join(pf.skipped))
+
+    def test_append_rows_adds_below_last_data_row_despite_template_format(self) -> None:
+        # 2026-11-24 实测：表尾追加行即使格式是文本，Plan_Save 后重开仍在
+        cells = {"AA57": "A", "AB57": "X", "AI57": 1}
+        formats = {"AA57": "G/通用格式", "AB57": "G/通用格式", "AI57": "0.00"}
+        sheet = FakeSheet(cells, formats=formats, default_format="@")
+        engine = FakeEngine(sheet=sheet)
+        writer = FormWriter(engine, {**KEYED_CFG, "input_rows": [57, 59],
+                                     "append_rows": True})
+        pf = writer.preflight([{"组织": "B", "科目": "Y", "2027.01": 5}])
+        self.assertTrue(pf.ok, pf.checks)
+        self.assertEqual(pf.key_updates, {"AA58": "B", "AB58": "Y"})
+        self.assertEqual([r["cell"] for r in pf.matched_rows], ["AI58"])
+        self.assertEqual(pf.new_rows[0]["row"], 58)
+
+    def test_append_rows_respects_input_rows_limit(self) -> None:
+        # 追加行必须仍在配置的可写范围内
+        engine = FakeEngine({"AA57": "A", "AB57": "X"})
+        writer = FormWriter(engine, {**KEYED_CFG, "input_rows": [57, 57],
+                                     "append_rows": True})
+        pf = writer.preflight([{"组织": "B", "科目": "Y", "2027.01": 5}])
+        self.assertFalse(pf.ok)
+        self.assertEqual(pf.key_updates, {})
+        self.assertIn("无空白行", " ".join(pf.skipped))
+
 
 class MeasureBlockHeaderTests(unittest.TestCase):
     """价格&销量表的度量块宽度随版本变化：必须按表头动态识别列。"""
@@ -360,6 +440,45 @@ class MeasureBlockHeaderTests(unittest.TestCase):
             {"AN57", "AU57", "BB57"},          # 表头识别出的 2027.05 列
         )
         self.assertNotIn("配置缺少期间", " ".join(d for _, _, d in pf.checks))
+
+    APPEND_CFG = {
+        **MEASURE_CFG,
+        "input_rows": [57, 59],
+        "append_rows": True,
+        "new_row_copy": {"match_column": "AD", "columns": ["AE", "AF", "AG"]},
+    }
+
+    def _with_product_row(self, product: str = "P") -> dict:
+        cells = self._seven_col_headers()
+        cells.update({
+            "AA57": "A", "AB57": "B", "AC57": "C", "AD57": product,
+            "AE57": "M1", "AF57": "32A30", "AG57": "量产", "AK57": 1.0,
+        })
+        return cells
+
+    def test_appended_row_copies_product_dims_from_existing_row(self) -> None:
+        # 价格表数据只有四维；表尾新增行还必须写 AE/AF/AG，否则 AO 不接受
+        engine = FakeEngine(self._with_product_row())
+        writer = FormWriter(engine, self.APPEND_CFG)
+        pf = writer.preflight([{**self.ROW, "渠道": "D"}])
+        self.assertTrue(pf.ok, pf.checks)
+        self.assertEqual(pf.key_updates, {
+            "AA58": "A", "AB58": "D", "AC58": "C", "AD58": "P",
+            "AE58": "M1", "AF58": "32A30", "AG58": "量产",
+        })
+        self.assertEqual({r["cell"] for r in pf.matched_rows},
+                         {"AK58", "AR58", "AY58"})
+        self.assertEqual(pf.new_rows[0]["row"], 58)
+
+    def test_appended_row_without_copy_source_is_skipped(self) -> None:
+        # 数据里的产品在表单中没有任何既有行 → 无法复制型号维度，不能猜
+        engine = FakeEngine(self._with_product_row(product="OTHER"))
+        writer = FormWriter(engine, self.APPEND_CFG)
+        pf = writer.preflight([{**self.ROW, "渠道": "D"}])
+        self.assertFalse(pf.ok)
+        self.assertEqual(pf.key_updates, {})
+        self.assertEqual(pf.new_rows, [])
+        self.assertIn("无同产品行可复制维度", " ".join(pf.skipped))
 
 
 class VersionAndLockTests(unittest.TestCase):

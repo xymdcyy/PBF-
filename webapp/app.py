@@ -31,7 +31,8 @@ from paths import app_root
 from data_dirs import latest_data_dir as find_latest_data_dir
 from engine.business_units import UnitError, csv_dimension_warnings, default_unit, get_unit
 from engine.periods import parse_periods
-from webapp.runs import RunRegistry, can_force_release, should_hold_slot
+from webapp.runs import (RunRegistry, can_force_release, run_owned_pids,
+                         should_hold_slot)
 from webapp.security import origin_allowed
 
 APP_ROOT = app_root()
@@ -155,12 +156,16 @@ RUN_TIMEOUT_ENV = "PBF_RUN_TIMEOUT_SEC"
 RUN_TIMEOUT_DEFAULT_SEC = 0
 
 
-def _child_env() -> dict:
+def _child_env(state: dict | None = None) -> dict:
     env = os.environ.copy()
     # 让 cli.py 的 print 立即落盘，便于网页实时看到日志
     env["PYTHONUNBUFFERED"] = "1"
     # 子进程 stdout 是管道而不是控制台；固定 UTF-8，避免中文日志在父进程里乱码
     env["PYTHONIOENCODING"] = "utf-8"
+    cancel_path = (state or {}).get("cancel_path")
+    if cancel_path:
+        # 取消不走 taskkill 硬杀：写标志文件，CLI 在安全点收尾
+        env["PBF_CANCEL_FILE"] = str(cancel_path)
     return env
 
 
@@ -183,17 +188,25 @@ def _kill_tree(pid: int) -> bool:
         return False
 
 
-def _excel_running() -> bool:
-    """Excel 是否仍在运行；检测失败时按"在运行"处理（宁可多占位，不可抢跑）。"""
+def _excel_pids_snapshot() -> list[int] | None:
+    """当前 Excel PID 快照；枚举失败返回 None（无法判断时按"仍在运行"处理）。"""
     try:
         from engine.bootstrap import excel_pids
-        return bool(excel_pids())
+        return list(excel_pids())
     except Exception:
-        return True
+        return None
+
+
+def _run_owned_excel_alive(state: dict) -> bool:
+    """本次运行启动的 Excel 是否还在运行（用户原有的 Excel 不算）。"""
+    pids = _excel_pids_snapshot()
+    if pids is None:
+        return True              # 无法判断：宁可多占位，不可抢跑
+    return bool(run_owned_pids(state, pids))
 
 
 def _try_release_stuck_run() -> None:
-    """占位运行卡住时（kill 失败/Excel 未退出），条件解除后自动释放槽位。"""
+    """占位运行卡住时（kill 失败/本次运行的 Excel 未退出），条件解除后自动释放槽位。"""
     cur = REGISTRY.current
     if cur is None:
         return
@@ -203,7 +216,9 @@ def _try_release_stuck_run() -> None:
     proc = state.get("proc")
     if proc is not None and proc.poll() is None:
         return
-    if _excel_running():
+    if state.get("cancel_package_running"):
+        return                    # 运行包可能仍在 BPC 后台执行，只能人工确认后释放
+    if _run_owned_excel_alive(state):
         return
     state["stuck"] = False
     REGISTRY.end(cur)
@@ -214,18 +229,48 @@ def _busy_reason() -> str:
     cur = REGISTRY.current
     state = REGISTRY.get(cur) if cur else None
     if state and state.get("stuck"):
-        return ("上一次运行被取消/超时后未能确认 Excel 退出，运行槽位仍被占用；"
-                "请关闭残留的 EXCEL.EXE，或确认没有宏在运行后点『强制释放槽位』再重试")
+        return ("上一次运行被取消/超时后，这次运行启动的 Excel 仍在运行，运行槽位"
+                "仍被占用；请等它退出（会自动释放），或确认没有宏在运行后点"
+                "『强制释放槽位』再重试")
     return "已有一个流程在运行，请等待其结束"
 
 
+CANCEL_GRACE_ENV = "PBF_CANCEL_GRACE_SEC"
+CANCEL_GRACE_DEFAULT_SEC = 60
+
+
+def _cancel_grace_sec() -> float:
+    """取消后等 CLI 在安全点自行收尾的时长；超时才 taskkill。"""
+    try:
+        value = float(os.environ.get(CANCEL_GRACE_ENV, CANCEL_GRACE_DEFAULT_SEC))
+    except ValueError:
+        value = float(CANCEL_GRACE_DEFAULT_SEC)
+    return value if value > 0 else float(CANCEL_GRACE_DEFAULT_SEC)
+
+
+def _write_cancel_flag(state: dict) -> None:
+    path = state.get("cancel_path")
+    if not path:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("cancel", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _run_step(cmd: list[str], lf, state: dict) -> int:
-    """启动并等待一个 cli.py 子进程；支持取消与超时。"""
+    """启动并等待一个 cli.py 子进程；支持优雅取消与超时。
+
+    取消不立刻 taskkill：先写取消标志，CLI 在安全点（写前/保存前/步骤间）
+    自行关闭未完成的工作簿并退出；等满宽限期仍未退出才硬杀。硬杀会把 Excel
+    停在写入/保存中途，留下无窗口僵尸实例，下一次运行 AO 登录框弹不出来。
+    """
     if state.get("cancelled"):
         return -1
     try:
         proc = subprocess.Popen(
-            cmd, cwd=str(APP_ROOT), env=_child_env(),
+            cmd, cwd=str(APP_ROOT), env=_child_env(state),
             stdout=lf, stderr=subprocess.STDOUT)
     except Exception as exc:
         lf.write(f"[Web] 无法启动子进程：{exc}\n")
@@ -233,26 +278,60 @@ def _run_step(cmd: list[str], lf, state: dict) -> int:
         return -1
     state["proc"] = proc
     if state.get("cancelled"):
-        _kill_tree(proc.pid)
+        _write_cancel_flag(state)
+
     timeout = _run_timeout_sec()
-    try:
-        rc = proc.wait(timeout=timeout)
+    started = time.time()
+    cancel_deadline: float | None = None
+    grace = _cancel_grace_sec()
+
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            if state.get("cancelled"):
+                if rc == 3:
+                    # CLI 专用退出码：取消时运行包已触发，后台可能仍在执行
+                    state["cancel_package_running"] = True
+                    lf.write("[Web] 已按取消请求停止等待；运行包已触发，可能仍在 BPC "
+                             "后台执行。确认执行结束后请点『强制释放槽位』。\n")
+                else:
+                    state["cancel_graceful"] = True
+                    lf.write(f"[Web] 已按取消请求在安全点结束（退出码 {rc}）。\n")
+                lf.flush()
+            return rc
+
+        now = time.time()
         if state.get("cancelled"):
-            lf.write(f"[Web] 已按取消请求终止（退出码 {rc}）。\n")
+            if cancel_deadline is None:
+                cancel_deadline = now + grace
+                _write_cancel_flag(state)
+                lf.write(f"[Web] 已请求取消，等待流程在安全点收尾"
+                         f"（最长 {grace:.0f}s）…\n")
+                lf.flush()
+            elif now >= cancel_deadline:
+                lf.write("[Web] 安全点等待超时，强制终止子进程树。\n")
+                lf.flush()
+                _kill_tree(proc.pid)
+                try:
+                    return proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    # taskkill 后子进程仍在：绝不放行新流程，槽位保持占用直到确认退出
+                    lf.write("[Web] 终止失败，子进程仍在运行；请手动结束该进程后重试。\n")
+                    lf.flush()
+                    return -1
+        elif timeout is not None and now - started >= timeout:
+            state["timed_out"] = True
+            lf.write(f"[Web] 运行超过 {timeout:g}s 未结束，已终止子进程树。\n")
             lf.flush()
-        return rc
-    except subprocess.TimeoutExpired:
-        state["timed_out"] = True
-        lf.write(f"[Web] 运行超过 {timeout:g}s 未结束，已终止子进程树。\n")
-        lf.flush()
-        _kill_tree(proc.pid)
-        try:
-            return proc.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            # taskkill 后子进程仍在：绝不放行新流程，槽位保持占用直到确认退出
-            lf.write("[Web] 终止失败，子进程仍在运行；请手动结束该进程后重试。\n")
-            lf.flush()
-            return -1
+            _kill_tree(proc.pid)
+            try:
+                return proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                lf.write("[Web] 终止失败，子进程仍在运行；请手动结束该进程后重试。\n")
+                lf.flush()
+                return -1
+
+        time.sleep(0.5)
 
 
 def _spawn(params: dict) -> str | None:
@@ -272,7 +351,11 @@ def _spawn(params: dict) -> str | None:
 
     state = {"run_id": run_id, "done": False, "exit_code": None, "cancelled": False,
              "timed_out": False, "proc": None, "log_path": log_path,
-             "report_path": report_path, "started": time.time()}
+             "report_path": report_path, "started": time.time(),
+             # 取消标志文件：CLI 在安全点检查；每次运行独立，不会串用旧标志
+             "cancel_path": WEB_RUN_DIR / f"{run_id}.cancel",
+             # 运行前的 Excel 基线：只有运行期间新出现的 Excel 才算本次运行所有
+             "excel_pids_before": _excel_pids_snapshot()}
     _try_release_stuck_run()
     if not REGISTRY.begin(run_id, state):
         return None
@@ -335,11 +418,14 @@ def _spawn(params: dict) -> str | None:
         finally:
             proc = state.get("proc")
             state["done"] = True
-            # 取消/超时后只有确认子进程死亡且 Excel 已退出才释放槽位；
-            # 否则两个流程会操作同一个 Excel。卡住的占位在条件解除后由
-            # _try_release_stuck_run() 自动放行。
+            # 取消/超时后：子进程死了、且本次运行启动的 Excel 也退出（或已在
+            # 安全点优雅结束）才释放槽位。用户原有的 Excel 不再占用槽位。
+            # 卡住的占位在条件解除后由 _try_release_stuck_run() 自动放行。
             proc_alive = proc is not None and proc.poll() is None
-            hold = should_hold_slot(state, proc_alive, _excel_running())
+            current_pids = _excel_pids_snapshot()
+            state["excel_pids_end"] = current_pids
+            state["excel_owned_pids"] = sorted(run_owned_pids(state, current_pids))
+            hold = should_hold_slot(state, proc_alive, current_pids)
             # 占位时保留 Popen：人工释放接口要确认子进程是否真的退出；
             # 正常结束则清掉引用。
             if not hold:
@@ -347,13 +433,19 @@ def _spawn(params: dict) -> str | None:
             if hold:
                 state["stuck"] = True
                 try:
-                    with open(log_path, "a", encoding="utf-8") as lf:
-                        lf.write("[Web] 未能确认子进程/Excel 完全退出，运行槽位继续保持"
-                                 "占用；请手动关闭残留的 EXCEL.EXE，关闭后即可重新运行。\n")
+                    with open(log_path, "a", encoding="utf-8") as fh:
+                        fh.write("[Web] 本次运行启动的 Excel 可能仍在执行宏，运行槽位继续"
+                                 "保持占用；等它退出后会自动释放（也可在确认没有宏在运行后"
+                                 "点『强制释放槽位』）。\n")
                 except OSError:
                     pass
             else:
                 REGISTRY.end(run_id)
+            # 取消标志文件用完即删，避免日志目录里越积越多
+            try:
+                state["cancel_path"].unlink()
+            except (OSError, AttributeError):
+                pass
 
     threading.Thread(target=worker, daemon=True).start()
     return run_id
@@ -576,6 +668,7 @@ def api_run_log(run_id: str):
     return jsonify({
         "ok": True, "done": state["done"], "exit_code": exit_code,
         "cancelled": bool(state.get("cancelled")),
+        "cancel_graceful": bool(state.get("cancel_graceful")),
         "timed_out": bool(state.get("timed_out")),
         "stuck": bool(state.get("stuck")),
         "lines": new, "next_offset": len(content),
@@ -608,11 +701,13 @@ def api_run_cancel(run_id: str):
     if state["done"]:
         return jsonify({"ok": False, "error": "流程已结束，无法取消"}), 400
     state["cancelled"] = True
+    # 优雅取消：写标志文件，CLI 在安全点（写前/保存前/步骤间）自行收尾；
+    # 不会立刻 taskkill，避免把 Excel 停在写入/保存中途留下僵尸实例。
+    _write_cancel_flag(state)
     proc = state.get("proc")
     if proc is not None and proc.poll() is None:
-        _kill_tree(proc.pid)
-        note = ("已终止子进程（Excel 由 COM 启动、不在子进程树内，taskkill 杀不到；"
-                "若 Excel 未自动退出请手动关闭，运行槽位会保持占用直到 Excel 退出）")
+        note = (f"已请求取消，正在等待流程在安全点收尾（最长 {_cancel_grace_sec():.0f}s）；"
+                "完成后 Excel 会保留导航表，下次运行直接复用")
     else:
         note = "已标记取消；当前步骤尚未启动子进程"
     return jsonify({"ok": True, "note": note})

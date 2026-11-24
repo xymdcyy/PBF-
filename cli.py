@@ -41,6 +41,8 @@ from engine import (ExcelEngine, ExcelError, FormWriter, Navigator, RunPackageRu
                     FormReader, FormScanner, ensure_excel_ready, run_flow)
 from engine.business_units import (UnitError, apply_unit, check_units,
                                    csv_dimension_warnings, default_unit)
+from engine.cancel import CancelledError, set_cancel_file_from_env
+from engine.orchestrator import close_form_workbooks_on_cancel
 from engine.clear import FORM_SCHEMA, clear_data
 from engine.config_check import (Issue, check_flow, check_form_config,
                                  resolve_from_step)
@@ -60,6 +62,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("cli")
+
+# Web 界面通过 PBF_CANCEL_FILE 传入取消标志文件；命令行直接运行时为空，
+# 取消检查恒为 False，行为与以前一致
+set_cancel_file_from_env()
 
 
 # ---------- helpers ----------
@@ -647,15 +653,26 @@ def cmd_run_flow(args) -> None:
                         check_data=not (args.skip_fill or args.only_verify),
                         from_step=from_step)
 
-    engine = ensure_excel_ready(flow_cfg)
-
-    report = run_flow(engine, flow_cfg, form_cfgs, data_dir,
-                      skip_fill=args.skip_fill, only_verify=args.only_verify,
-                      expected_version=args.version,
-                      from_step=from_step if raw_from_step else None,
-                      preflight_only=preflight_only,
-                      switch_version_key=getattr(args, "version_key", None),
-                      clear_mode=bool(getattr(args, "clear_mode", False)))
+    engine = None
+    try:
+        engine = ensure_excel_ready(flow_cfg)
+        report = run_flow(engine, flow_cfg, form_cfgs, data_dir,
+                          skip_fill=args.skip_fill, only_verify=args.only_verify,
+                          expected_version=args.version,
+                          from_step=from_step if raw_from_step else None,
+                          preflight_only=preflight_only,
+                          switch_version_key=getattr(args, "version_key", None),
+                          clear_mode=bool(getattr(args, "clear_mode", False)))
+    except CancelledError as exc:
+        # 安全点取消：不保存未完成的修改，关闭表单工作簿（不碰导航表/用户工作簿）
+        print(f"\n[已取消] {exc}")
+        closed = close_form_workbooks_on_cancel(engine, form_cfgs, flow_cfg)
+        if closed:
+            print(f"[已取消] 已关闭未完成的工作簿（不保存）：{', '.join(closed)}")
+        write_report_file(args, {"cancelled": True, "message": str(exc)})
+        # 退出码 3：取消时运行包已触发、可能仍在 BPC 后台执行。Web 界面据此
+        # 保留运行槽位，避免在运行包没结束时又启动一轮流程。
+        sys.exit(3 if "运行包" in str(exc) else 1)
     if unit_name:
         report["unit"] = unit_name
 
