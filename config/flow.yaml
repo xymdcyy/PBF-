@@ -81,7 +81,9 @@ steps:
     data: HQ毛上调整.csv
     after_close:
       nav_cell: AC62                   # 毛利之上查询-CBG-乐华
-      packages: [52, 53]               # R52=收入计算  R53=成本计算
+      packages:                        # 行号 → 期望包名（AB73 实际存面板 AP 列模块名 PS_...，非 AS 列说明）
+        52: 滚动预测收入计算           # AB73: PS_经营模型_收入_预测_滚动预测收入计算_价量一起编制
+        53: 计算到销售组织的成本       # AB73: PS_经营模型_收入_预测_计算到销售组织的成本
   - form: E61_CBG_其他成本编制
     nav_cell: AC63                     # CBG-其他成本编制-智屏-乐华
     data: 其他成本.csv
@@ -92,7 +94,8 @@ steps:
     data: 费用及损益其他项.csv
     after_close:
       nav_cell: AC70                   # CBG损益查询流程 / CBG-乐华
-      packages: [52]                   # 计算滚动预测损益
+      packages:
+        52: PS_计算损益_滚动预测       # AB73 原值（20261123.jsonl 18:35 财总版清 0 续跑实测）
 
 # ---------- 损益核对 ----------
 verify:

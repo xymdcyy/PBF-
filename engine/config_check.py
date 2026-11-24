@@ -330,7 +330,17 @@ def check_flow(flow_cfg: dict, form_cfgs: dict[str, dict], data_dir: Path,
         after_close = step.get("after_close") or {}
         if after_close and not after_close.get("nav_cell"):
             issues.append(_err(f"steps[{i}]（{form_id}）after_close 缺少 nav_cell"))
-        if after_close.get("packages") and not all(
-                isinstance(r, int) and r > 0 for r in after_close["packages"]):
-            issues.append(_err(f"steps[{i}]（{form_id}）after_close.packages 应为行号列表"))
+        pkgs = after_close.get("packages")
+        if pkgs:
+            if isinstance(pkgs, dict):
+                bad = {r: n for r, n in pkgs.items()
+                       if not (isinstance(r, int) and r > 0 and str(n or "").strip())}
+                if bad:
+                    issues.append(_err(
+                        f"steps[{i}]（{form_id}）after_close.packages 应为"
+                        f"「行号: 期望包名」，非法项：{bad}"))
+            elif not all(isinstance(r, int) and r > 0 for r in pkgs):
+                issues.append(_err(
+                    f"steps[{i}]（{form_id}）after_close.packages 应为行号列表，"
+                    "或「行号: 期望包名」映射"))
     return issues
