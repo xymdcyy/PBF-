@@ -142,9 +142,21 @@ def _package_items(packages) -> list[tuple[int, str]]:
     - ``[52, 53]``      旧行号列表：无包名校验
     - ``52: 收入计算``  行号 → 期望包名映射：开单后核对清单 AB73 步骤名，
       不符即中止（步骤面板停在别的同类型行上时会开到错误的包上下文）
+
+    映射写法里包名必须非空：空的会悄悄跳过 AB73 校验，等于误配把新
+    防线关掉了——宁可在跑之前就报错。
     """
     if isinstance(packages, dict):
-        return [(int(r), str(n or "").strip()) for r, n in packages.items()]
+        items: list[tuple[int, str]] = []
+        for r, n in packages.items():
+            name = str(n or "").strip()
+            if not name:
+                raise ExcelError(
+                    f"after_close.packages 配置了「行号: 包名」映射，但行 {r} 的包名为空"
+                    "（空包名会跳过 AB73 步骤名校验）。请补上包名，"
+                    "或改回行号列表写法 [52, 53]")
+            items.append((int(r), name))
+        return items
     return [(int(r), "") for r in (packages or [])]
 
 
