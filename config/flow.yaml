@@ -81,7 +81,9 @@ steps:
     data: HQ毛上调整.csv
     after_close:
       nav_cell: AC62                   # 毛利之上查询-CBG-乐华
-      packages: [52, 53]               # R52=收入计算  R53=成本计算
+      packages:                        # 行号 → 期望包名：开单后核对清单 AB73 步骤名，不符即中止
+        52: 收入计算
+        53: 成本计算
   - form: E61_CBG_其他成本编制
     nav_cell: AC63                     # CBG-其他成本编制-智屏-乐华
     data: 其他成本.csv
@@ -92,7 +94,8 @@ steps:
     data: 费用及损益其他项.csv
     after_close:
       nav_cell: AC70                   # CBG损益查询流程 / CBG-乐华
-      packages: [52]                   # 计算滚动预测损益
+      packages:
+        52: 计算滚动预测损益
 
 # ---------- 损益核对 ----------
 verify:

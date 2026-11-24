@@ -135,6 +135,19 @@ def is_session_expired(exc: BaseException) -> bool:
     return any(marker in text for marker in _SESSION_EXPIRED_MARKERS)
 
 
+def _package_items(packages) -> list[tuple[int, str]]:
+    """steps[].after_close.packages → [(行号, 期望包名)]。
+
+    兼容两种写法：
+    - ``[52, 53]``      旧行号列表：无包名校验
+    - ``52: 收入计算``  行号 → 期望包名映射：开单后核对清单 AB73 步骤名，
+      不符即中止（步骤面板停在别的同类型行上时会开到错误的包上下文）
+    """
+    if isinstance(packages, dict):
+        return [(int(r), str(n or "").strip()) for r, n in packages.items()]
+    return [(int(r), "") for r in (packages or [])]
+
+
 class PbfFlow:
     def __init__(self, engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Path,
                  persist_panel_cache: bool = False) -> None:
@@ -822,8 +835,13 @@ class PbfFlow:
         log.info(f"{form_id}: 执行 {macro} 完成（{int((time.time()-t0)*1000)}ms）")
         time.sleep(3)
 
-    def run_package(self, nav_cell: str, step_row: int) -> dict:
-        """打开运行包清单 → Execute → 轮询状态 → 关闭。"""
+    def run_package(self, nav_cell: str, step_row: int, expected_name: str = "") -> dict:
+        """打开运行包清单 → Execute → 轮询状态 → 关闭。
+
+        expected_name：该行号期望的包名（flow.yaml after_close.packages 的
+        「行号: 包名」写法）。步骤面板若停在别的同类型行上，会开到错误的
+        包上下文——清单 AB73 的步骤名与期望对不上就中止，绝不执行错包。
+        """
         self.ensure_navigator_version()
         self._close_if_open(self.pkg_cfg["workbook_pattern"])
         self.open_via_nav(nav_cell, open_cell=f"AT{step_row}",
@@ -834,6 +852,17 @@ class PbfFlow:
 
         version = str(self._read(ws, self.pkg_cfg.get("version_cell", "AB60")) or "")
         step_name = str(self._read(ws, self.pkg_cfg["step_cell"]) or "")
+        expected = str(expected_name or "").strip()
+        if expected and expected not in step_name:
+            try:
+                self.engine.close_workbook(wb, save=False)
+            except Exception as exc:
+                log.warning(f"关闭不符的运行包清单失败（忽略）: {exc}")
+            raise ExcelError(
+                f"运行包步骤名不符：清单显示「{step_name}」，期望「{expected}」。"
+                "可能是步骤面板停在了别的同类型行上（不同行的按钮位置相同），"
+                "或 after_close.packages 的行号/包名配置有误；"
+                "已关闭清单、未执行任何宏，请核对后重试")
         log.info(f"运行包: {step_name} | 版本: {version}")
 
         self.engine.run_macro(self.pkg_cfg["execute_macro"], wb)
@@ -1250,8 +1279,8 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
 
         after_close = step.get("after_close") or {}
         if after_close:
-            for row in after_close.get("packages", []):
-                r = flow.run_package(after_close["nav_cell"], row)
+            for row, expected in _package_items(after_close.get("packages")):
+                r = flow.run_package(after_close["nav_cell"], row, expected_name=expected)
                 report["packages"].append(r)
                 if not r["ok"]:
                     raise ExcelError(f"运行包未成功: {r}")

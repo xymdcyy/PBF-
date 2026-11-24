@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import fnmatch
 import sys
 import time
 import unittest
@@ -39,6 +40,16 @@ class FakeWorkbook:
 
     def Activate(self) -> None:     # noqa: N802
         return None
+
+
+class FakePkgSheet:
+    """运行包执行清单：AB73 步骤名 / AB60 版本 / AO73 状态 / AW73 时长。"""
+
+    def __init__(self, cells: dict) -> None:
+        self.cells = dict(cells)
+
+    def value(self, addr: str):
+        return self.cells.get(addr)
 
 
 class FakeSheet:
@@ -109,26 +120,48 @@ class FakeEngine:
         self.names = [wb.Name]
         self.pid = 4321
         self.macro_error: Exception | None = None
+        self.pkg_sheet: FakePkgSheet | None = None
+        self.closed: list[str] = []
+        self.macros_run: list[str] = []
 
     def _retry(self, fn, attempts: int = 1, delay: float = 0.0):
         return fn()
 
-    def get_workbook(self, pattern: str, wait_sec: int = 0) -> FakeWorkbook:
-        return self.wb
+    def _find_wb(self, pattern: str) -> FakeWorkbook:
+        for name in self.names:
+            if fnmatch.fnmatchcase(name, pattern):
+                if "运行包" in name:
+                    # 运行包清单每次打开都是新副本（名字带时间戳）
+                    return FakeWorkbook(name)
+                return self.wb
+        raise ExcelError(f"没找到匹配 {pattern} 的工作簿")
 
-    def open_sheet(self, wb, name: str) -> FakeSheet:
+    def get_workbook(self, pattern: str, wait_sec: int = 0) -> FakeWorkbook:
+        return self._find_wb(pattern)
+
+    def find_workbook(self, pattern: str) -> FakeWorkbook:
+        return self._find_wb(pattern)
+
+    def open_sheet(self, wb, name: str):
+        if "运行包" in getattr(wb, "Name", "") and self.pkg_sheet is not None:
+            return self.pkg_sheet
         return self.sheet
 
     def workbook_names(self) -> list[str]:
         return list(self.names)
 
-    def read(self, sheet: FakeSheet, cell: str):
+    def close_workbook(self, wb, save: bool = False) -> None:
+        self.closed.append(wb.Name)
+        self.names = [n for n in self.names if n != wb.Name]
+
+    def read(self, sheet, cell: str):
         return sheet.value(cell)
 
     def select(self, sheet: FakeSheet, cell: str) -> None:
         sheet.select(cell)
 
     def run_macro(self, name: str, wb=None, *args):
+        self.macros_run.append(name)
         if self.macro_error is not None:
             raise self.macro_error
         return None
@@ -166,7 +199,18 @@ def make_flow(refresh_on_select: bool = True):
             "panel_wait_sec": 0.2,
             "version_cell": "AR45",
         },
-        "package": {"workbook_pattern": "PBF Pro运行包*", "sheet": "pkg"},
+        "package": {
+            "workbook_pattern": "PBF Pro运行包执行及日志查看清单*",
+            "sheet": "运行包执行及日志查看清单",
+            "execute_macro": "Trigger_PS",
+            "refresh_macro": "Refresh_Sheet",
+            "version_cell": "AB60",
+            "status_cell": "AO73",
+            "step_cell": "AB73",
+            "duration_cell": "AW73",
+            "poll_interval_sec": 0,
+            "max_wait_sec": 1,
+        },
         "verify_writeback": {},
     }
     flow = PbfFlow(engine, cfg, {}, Path("data_2027.02_clear"))
@@ -305,6 +349,51 @@ class PanelCacheTests(unittest.TestCase):
             flow2._panel_cache_file = cache_file
             flow2._load_panel_cache()
             self.assertEqual(flow2._panel_cache.get(key), data[key])
+
+
+class RunPackageTests(unittest.TestCase):
+    """运行包 AB73 步骤名校验：面板停在别的同类型行上时绝不执行错包。
+
+    评审 2026-11-24：accept_static 区分不了「面板停在目标行」和「面板停在
+    另一个同类型行」，点下去会开到错误的运行包上下文。清单工作簿名不随包变，
+    只能靠 AB73 步骤名与 flow.yaml 配置的期望名核对。
+    """
+
+    PKG_CELLS = {
+        "AB60": "滚动预测2026年11月财总版",
+        "AB73": "收入计算",
+        "AO73": "已完成",
+        "AW73": "0:01:23",
+    }
+
+    def test_step_name_match_runs_package(self) -> None:
+        flow, engine, _ = make_flow()
+        engine.pkg_sheet = FakePkgSheet(dict(self.PKG_CELLS))
+        r = flow.run_package("AC62", 52, expected_name="收入计算")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["package"], "收入计算")
+        self.assertIn("Trigger_PS", engine.macros_run)
+        self.assertIn("Refresh_Sheet", engine.macros_run)
+        # 跑完关闭清单
+        self.assertEqual(engine.closed, ["PBF Pro运行包执行及日志查看清单 (9-01).xlsb"])
+
+    def test_step_name_mismatch_raises_without_executing(self) -> None:
+        flow, engine, _ = make_flow()
+        engine.pkg_sheet = FakePkgSheet(dict(self.PKG_CELLS))   # 清单显示「收入计算」
+        with self.assertRaises(ExcelError) as ctx:
+            flow.run_package("AC62", 52, expected_name="成本计算")
+        self.assertIn("步骤名不符", str(ctx.exception))
+        self.assertIn("成本计算", str(ctx.exception))
+        # 核对不过就中止：Execute 宏一个都不能跑
+        self.assertNotIn("Trigger_PS", engine.macros_run)
+        self.assertEqual(engine.closed, ["PBF Pro运行包执行及日志查看清单 (9-01).xlsb"])
+
+    def test_legacy_list_packages_skip_verification(self) -> None:
+        # 旧行号列表写法（无期望包名）：不校验，行为同前
+        flow, engine, _ = make_flow()
+        engine.pkg_sheet = FakePkgSheet(dict(self.PKG_CELLS))
+        r = flow.run_package("AC62", 52)
+        self.assertTrue(r["ok"], r)
 
 
 class SessionExpiredDetectionTests(unittest.TestCase):
