@@ -3,92 +3,177 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#2563eb">
   <title>PBF 滚动预测自动编制</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%230b1220'/%3E%3Cpath d='M12 5 6 8.5v7L12 19l6-3.5v-7L12 5Z' fill='none' stroke='%2322d3ee' stroke-width='1.5'/%3E%3Cpath d='M6 8.5 12 12l6-3.5M12 12v7' fill='none' stroke='%236366f1' stroke-width='1.5'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-  <header>
-    <h1>PBF 滚动预测自动编制</h1>
-    <p class="sub">上传模板 → 自动导出 → 填入 SAP AO → 核对损益</p>
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="bg-orbs" aria-hidden="true">
+    <span class="orb orb-a"></span>
+    <span class="orb orb-b"></span>
+    <span class="orb orb-c"></span>
+  </div>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke-width="1.6"
+             stroke-linecap="round" stroke-linejoin="round">
+          <defs>
+            <linearGradient id="logo-grad" x1="0" y1="0" x2="24" y2="24" gradientUnits="userSpaceOnUse">
+              <stop offset="0" stop-color="#ffffff"/>
+              <stop offset="1" stop-color="#a5f3fc"/>
+            </linearGradient>
+          </defs>
+          <path stroke="url(#logo-grad)" d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/>
+          <path stroke="url(#logo-grad)" d="M4 7.5 12 12l8-4.5M12 12v9"/>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <h1>PBF <span>滚动预测自动编制</span></h1>
+        <p class="sub">上传模板 → 自动导出 → 填入 SAP AO → 核对损益</p>
+      </div>
+    </div>
+    <div class="top-chips">
+      <span class="chip"><span class="chip-dot"></span>本机运行</span>
+      <span class="chip mono">127.0.0.1</span>
+    </div>
   </header>
 
-  <main>
-    <!-- 1. 账号 -->
-    <section class="card">
-      <h2>① 账号</h2>
-      <div class="grid">
-        <label>用户名
-          <input id="username" type="text" placeholder="your.name" autocomplete="username">
-        </label>
-        <label>密码
-          <input id="password" type="password" placeholder="登录 SAP BPC 的密码" autocomplete="current-password">
-        </label>
-        <label>客户端
-          <input id="client" type="text" value="333">
-        </label>
-        <label>语言
-          <input id="lang" type="text" value="zh">
-        </label>
-      </div>
-      <div class="row">
-        <button id="btn-save-cred" class="primary">保存账号</button>
-        <span id="cred-status" class="status"></span>
-      </div>
-    </section>
+  <main class="workspace">
+    <div class="col">
 
-    <!-- 2. 编制参数 -->
-    <section class="card">
-      <h2>② 编制参数</h2>
-      <div class="grid">
-        <label>品牌 × 品类
-          <select id="unit"></select>
+      <!-- 1. 账号 -->
+      <section class="card">
+        <div class="card-head">
+          <span class="step">01</span>
+          <div>
+            <h2>登录账号</h2>
+            <p class="hint">凭据仅保存在本机，密码留空表示沿用已保存的值</p>
+          </div>
+        </div>
+        <div class="grid fields">
+          <label class="field"><span>用户名</span>
+            <input id="username" type="text" placeholder="your.name" autocomplete="username">
+          </label>
+          <label class="field"><span>密码</span>
+            <input id="password" type="password" placeholder="登录 SAP BPC 的密码" autocomplete="current-password">
+          </label>
+          <label class="field"><span>客户端</span>
+            <input id="client" type="text" value="333">
+          </label>
+          <label class="field"><span>语言</span>
+            <input id="lang" type="text" value="zh">
+          </label>
+        </div>
+        <div class="row">
+          <button id="btn-save-cred" class="btn primary">保存账号</button>
+          <span id="cred-status" class="status"></span>
+        </div>
+      </section>
+
+      <!-- 2. 编制参数 -->
+      <section class="card">
+        <div class="card-head">
+          <span class="step">02</span>
+          <div>
+            <h2>编制参数</h2>
+            <p class="hint">选择业务单元、版本与期间，运行前会逐表核对版本一致</p>
+          </div>
+        </div>
+        <div class="grid fields">
+          <label class="field"><span>品牌 × 品类</span>
+            <select id="unit"></select>
+          </label>
+          <label class="field"><span>版本</span>
+            <select id="version"></select>
+          </label>
+          <label class="field"><span>起始期间</span>
+            <select id="period-start"></select>
+          </label>
+          <label class="field"><span>结束期间</span>
+            <select id="period-end"></select>
+          </label>
+          <label class="check field-check">
+            <input id="switch-version" type="checkbox" checked>
+            <span>运行前先切换版本</span>
+          </label>
+        </div>
+      </section>
+
+      <!-- 3. 上传模板 -->
+      <section class="card">
+        <div class="card-head">
+          <span class="step">03</span>
+          <div>
+            <h2>上传模板表</h2>
+            <p class="hint">上传《滚动预测模板表》后自动导出为运行数据目录</p>
+          </div>
+        </div>
+        <label class="dropzone" id="dropzone">
+          <svg class="dz-icon" viewBox="0 0 24 24" width="26" height="26" fill="none"
+               stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 16V4m0 0 4 4m-4-4-4 4"/>
+            <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>
+          </svg>
+          <span class="dz-title">选择滚动预测模板表</span>
+          <span class="dz-sub">支持 .xlsx / .xlsm，也可直接拖拽文件到此处</span>
+          <span id="file-name" class="dz-file"></span>
+          <input id="file" type="file" accept=".xlsx,.xlsm">
         </label>
-        <label>版本
-          <select id="version"></select>
-        </label>
-        <label>期间（1–6 月）
-          <input id="period" type="text" placeholder="2027.01-2027.04（单值/列表/区间）">
-        </label>
-        <label class="check">
-          <input id="switch-version" type="checkbox" checked>
-          运行前先切换版本
-        </label>
-      </div>
-    </section>
+        <div class="row">
+          <button id="btn-upload" class="btn primary">上传并导出</button>
+        </div>
+        <div id="upload-result" class="note-slot"></div>
+      </section>
 
-    <!-- 3. 上传模板 -->
-    <section class="card">
-      <h2>③ 上传模板表</h2>
-      <div class="row">
-        <input id="file" type="file" accept=".xlsx,.xlsm">
-        <button id="btn-upload" class="primary">上传并导出</button>
-      </div>
-      <div id="upload-result" class="muted"></div>
-    </section>
+    </div>
 
-    <!-- 4. 运行 -->
-    <section class="card">
-      <h2>④ 运行</h2>
-      <div class="row">
-        <button id="btn-env" class="ghost">环境自检</button>
-        <button id="btn-run" class="primary" disabled>运行全流程</button>
-        <button id="btn-clear" class="danger">批量清除填 0</button>
-        <span id="run-status" class="status"></span>
-      </div>
-      <div id="env-result" class="muted"></div>
+    <div class="col">
+      <!-- 4. 运行 -->
+      <section class="card card-run">
+        <div class="card-head">
+          <span class="step">04</span>
+          <div class="grow">
+            <h2>运行控制</h2>
+            <p class="hint">同一时刻只允许一个流程；取消会在安全点收尾</p>
+          </div>
+          <span id="run-status" class="status">待命</span>
+        </div>
 
-      <div class="row" style="margin-top:12px">
-        <button id="btn-cancel" class="danger" disabled>取消</button>
-        <button id="btn-release" class="ghost" style="display:none">强制释放槽位</button>
-      </div>
+        <div class="run-actions">
+          <button id="btn-env" class="btn ghost">环境自检</button>
+          <button id="btn-run" class="btn primary" disabled>运行全流程</button>
+          <button id="btn-clear" class="btn danger">批量清除填 0</button>
+          <button id="btn-cancel" class="btn danger" disabled>取消</button>
+          <button id="btn-release" class="btn warn" style="display:none">强制释放槽位</button>
+        </div>
 
-      <h3>运行日志</h3>
-      <pre id="log" class="log"></pre>
+        <div id="env-result" class="env-result"></div>
 
-      <h3>损益核对</h3>
-      <div id="result"></div>
-    </section>
+        <div class="terminal">
+          <div class="term-bar">
+            <span class="term-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span class="term-title">运行日志</span>
+            <span class="term-live"><i class="live-dot"></i>LIVE</span>
+          </div>
+          <pre id="log" class="log"></pre>
+        </div>
+
+        <div class="result-head">
+          <h3>损益核对</h3>
+          <span class="hint">来自本次运行的报告文件</span>
+        </div>
+        <div id="result" class="result-wrap">
+          <div class="empty">运行结束后显示损益核对结果</div>
+        </div>
+      </section>
+    </div>
   </main>
+
+  <footer class="foot">PBF Automation · 仅本机访问 · 数据不出本机</footer>
 
   <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>

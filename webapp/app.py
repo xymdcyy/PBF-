@@ -29,7 +29,9 @@ from flask import Flask, jsonify, render_template, request
 
 from paths import app_root
 from data_dirs import latest_data_dir as find_latest_data_dir
-from engine.business_units import UnitError, csv_dimension_warnings, default_unit, get_unit
+from engine.business_units import (UnitError, check_units,
+                                   csv_dimension_warnings, default_unit, get_unit)
+from engine.config_check import check_flow, check_form_config
 from engine.periods import parse_periods
 from webapp.runs import (RunRegistry, can_force_release, run_owned_pids,
                          should_hold_slot)
@@ -453,60 +455,243 @@ def _spawn(params: dict) -> str | None:
 
 # ---------- 环境自检 ----------
 
-def _proc_running(*names: str) -> bool:
-    try:
-        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
-                             capture_output=True, text=True, timeout=15).stdout
-    except Exception:
-        return False
-    upper = out.upper()
-    return any(n.upper() in upper for n in names)
+# 只做被动检查：不启动 Excel、不改任何状态。状态说明：
+#   ok    正常；
+#   warn  不阻塞运行，但值得留意（例如还没上传模板、AO 加载项未在注册表找到）；
+#   error 大概率会导致运行失败（缺依赖、导航表缺失、没保存账号等）。
+
+CHECK_DETAIL_LIMIT = 180
 
 
-def check_env() -> dict:
-    """被动自检，不启动 Excel、不改动任何状态。"""
-    checks = []
-    wps = _proc_running("et.exe", "wps.exe")
-    checks.append({"ok": True, "label": "WPS 状态",
-                   "detail": "WPS 表格在运行（已自动绕开，不影响 Excel 操作）" if wps
-                             else "WPS 未运行"})
+def _check(status: str, label: str, detail: str) -> dict:
+    return {"ok": status == "ok", "status": status, "label": label,
+            "detail": detail}
 
-    excel_pids = []
-    try:
-        from engine.bootstrap import excel_pids
-        excel_pids = excel_pids()
-    except Exception:
-        pass
-    excel_on = bool(excel_pids)
-    checks.append({"ok": excel_on, "label": "Excel 已运行",
-                   "detail": f"Excel 进程数 {len(excel_pids)}" if excel_on
-                             else "Excel 未运行（点运行时会尝试自动打开导航表）"})
 
-    nav_open = False
-    nav_detail = "未检测"
-    if excel_on:
+def _clip(text: str, limit: int = CHECK_DETAIL_LIMIT) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _registry_key_exists(root, path: str) -> bool:
+    import winreg
+    for view in (0, getattr(winreg, "KEY_WOW64_64KEY", 0),
+                 getattr(winreg, "KEY_WOW64_32KEY", 0)):
         try:
-            import win32com.client
-            xl = win32com.client.GetActiveObject("Excel.Application")
-            if float(str(xl.Version)) < 14:
-                nav_detail = "检测到 WPS 抢占 COM 接口（已自动排除）"
-            else:
-                flow = _load_yaml(FLOW_FILE)
-                pattern = (flow.get("navigator") or {}).get(
-                    "workbook_pattern", "PBF Pro - 全面预算系统流程导航*")
-                prefix = pattern.rstrip("*")
-                names = [w.Name for w in xl.Workbooks]
-                if any(n.startswith(prefix) for n in names):
-                    nav_open = True
-                    nav_detail = "导航表已打开"
-                else:
-                    nav_detail = "真实 Excel 已运行，但导航表未打开（运行时会自动打开）"
-        except Exception as exc:
-            nav_detail = f"导航表未检测到（{str(exc)[:80]}）"
-    checks.append({"ok": nav_open, "label": "AO 导航表",
-                   "detail": nav_detail})
+            with winreg.OpenKey(root, path, 0, winreg.KEY_READ | view):
+                return True
+        except OSError:
+            continue
+    return False
 
-    return {"checks": checks, "excel_on": excel_on, "wps_on": wps}
+
+def _ao_addin_name() -> str:
+    """在注册表里找 AO / BPC 的 Excel 加载项。
+
+    AO 的 ProgID 形如 AdHocReportingExcelClientAddIn，BPC EPM 为 FPMXLClient，
+    不同版本命名略有差异，因此按关键字匹配。
+    """
+    import winreg
+    roots = [
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Office\Excel\Addins"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Office\Excel\Addins"),
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"Software\WOW6432Node\Microsoft\Office\Excel\Addins"),
+    ]
+    marks = ("adhoc", "fpmxl", "analysisoffice", "analysis office", "bpc")
+    for root, path in roots:
+        for view in (0, getattr(winreg, "KEY_WOW64_64KEY", 0),
+                     getattr(winreg, "KEY_WOW64_32KEY", 0)):
+            try:
+                with winreg.OpenKey(root, path, 0, winreg.KEY_READ | view) as key:
+                    idx = 0
+                    while True:
+                        try:
+                            name = winreg.EnumKey(key, idx)
+                        except OSError:
+                            break
+                        if any(m in name.lower() for m in marks):
+                            return name
+                        idx += 1
+            except OSError:
+                continue
+    return ""
+
+
+def _check_runtime() -> dict:
+    import platform
+    from importlib.util import find_spec
+    missing = []
+    for module, pkg in (("win32com", "pywin32"), ("pandas", "pandas"),
+                        ("openpyxl", "openpyxl"), ("yaml", "PyYAML"),
+                        ("flask", "Flask")):
+        try:
+            found = find_spec(module) is not None
+        except (ImportError, ValueError):
+            found = False
+        if not found:
+            missing.append(pkg)
+    if missing:
+        return _check("error", "运行环境", f"缺少依赖：{', '.join(missing)}")
+    return _check("ok", "运行环境",
+                  f"Python {platform.python_version()} · 依赖齐全"
+                  "（pywin32 / pandas / openpyxl / PyYAML / Flask）")
+
+
+def _check_excel() -> dict:
+    import winreg
+    if not _registry_key_exists(winreg.HKEY_CLASSES_ROOT, r"Excel.Application\CLSID"):
+        return _check("error", "Excel / AO",
+                      "未检测到 Excel COM 注册，请确认已安装 Microsoft Excel")
+    addin = _ao_addin_name()
+    if addin:
+        return _check("ok", "Excel / AO", f"Excel 已安装 · AO 加载项已注册（{addin}）")
+    return _check("warn", "Excel / AO",
+                  "Excel 已安装，但注册表里没找到 SAP AO 加载项；"
+                  "若 Excel 中 AO 面板可用可忽略")
+
+
+def _check_navigator(flow_cfg: dict) -> dict:
+    nav = flow_cfg.get("navigator") or {}
+    source = str(nav.get("source") or "bw").lower()
+    launch = str(nav.get("launch_file") or "")
+    if source == "file" or launch:
+        if not launch:
+            return _check("error", "导航表", "flow.yaml 未配置 navigator.launch_file")
+        if Path(launch).exists():
+            return _check("ok", "导航表", f"导航表就绪：{Path(launch).name}")
+        return _check("error", "导航表", f"导航表不存在：{launch}")
+    if nav.get("bw_connection"):
+        return _check("ok", "导航表", f"BW 连接已配置：{nav.get('bw_connection')}")
+    return _check("warn", "导航表", "未配置 launch_file / bw_connection，将使用默认连接")
+
+
+def _check_credentials() -> dict:
+    creds = load_credentials()
+    user = os.environ.get("PBF_USERNAME") or str(creds.get("username") or "")
+    password = os.environ.get("PBF_PASSWORD") or str(creds.get("password") or "")
+    client = (os.environ.get("PBF_CLIENT") or creds.get("client") or "333")
+    if user and password:
+        return _check("ok", "登录凭据", f"已保存：{user} · 客户端 {client}")
+    if user:
+        return _check("warn", "登录凭据",
+                      f"已有用户名 {user}，但密码未保存（运行时会弹登录框）")
+    return _check("error", "登录凭据", "未保存账号，请先在「登录账号」里保存")
+
+
+def _check_units_env(flow_cfg: dict, unit: str) -> dict:
+    units_cfg = load_business_units()
+    if not units_cfg.get("units"):
+        return _check("warn", "业务单元", "未配置业务单元（将按 flow.yaml 默认导航行运行）")
+    name, err = _resolve_unit(unit)
+    if err:
+        return _check("error", "业务单元", err)
+    try:
+        u = get_unit(units_cfg, name)
+    except UnitError as exc:
+        return _check("error", "业务单元", str(exc))
+    detail = f"{name} · 品牌 {u.get('品牌', '')} · 品类 {u.get('品类', '')}"
+    issues = check_units(units_cfg, flow_cfg, only=name)
+    errors = [i for i in issues if str(i).startswith("错误")]
+    warns = [i for i in issues if str(i).startswith("告警")]
+    if errors:
+        return _check("error", "业务单元", f"{detail}：" + _clip("；".join(errors)))
+    if warns:
+        return _check("warn", "业务单元", f"{detail}：" + _clip("；".join(warns)))
+    return _check("ok", "业务单元", f"{detail} 配置通过")
+
+
+def _load_form_configs() -> dict[str, dict]:
+    cfgs: dict[str, dict] = {}
+    forms_dir = CONFIG_DIR / "forms"
+    if not forms_dir.exists():
+        return cfgs
+    for path in sorted(forms_dir.glob("*.yaml")):
+        cfg = _load_yaml(path)
+        if cfg:
+            cfgs[str(cfg.get("form_id") or path.stem)] = cfg
+    return cfgs
+
+
+def _issue_check(label: str, issues: list, ok_detail: str) -> dict:
+    errors = [i for i in issues if getattr(i, "level", "") == "error"]
+    warns = [i for i in issues if getattr(i, "level", "") == "warning"]
+    if errors:
+        return _check("error", label,
+                      f"{len(errors)} 个错误：" + _clip("；".join(str(i) for i in errors)))
+    if warns:
+        return _check("warn", label,
+                      f"{len(warns)} 个告警：" + _clip("；".join(str(i) for i in warns)))
+    return _check("ok", label, ok_detail)
+
+
+def _check_flow_config(flow_cfg: dict, form_cfgs: dict[str, dict]) -> dict:
+    issues = []
+    for form_id, cfg in form_cfgs.items():
+        issues.extend(check_form_config(form_id, cfg))
+    issues.extend(check_flow(flow_cfg, form_cfgs, APP_ROOT, check_data=False))
+    steps = len(flow_cfg.get("steps") or [])
+    return _issue_check("流程配置", issues,
+                        f"{len(form_cfgs)} 个表单配置 · {steps} 个流程步骤校验通过")
+
+
+def _count_csv_rows(data_dir: Path) -> tuple[int, int]:
+    files = rows = 0
+    for path in sorted(data_dir.glob("*.csv")):
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                lines = sum(1 for _ in fh)
+        except OSError:
+            continue
+        files += 1
+        rows += max(lines - 1, 0)
+    return files, rows
+
+
+def _check_template(flow_cfg: dict, form_cfgs: dict[str, dict], period: str) -> dict:
+    try:
+        periods = parse_periods(period) if period else []
+    except ValueError as exc:
+        return _check("error", "模板数据", f"期间格式错误：{exc}")
+    if periods:
+        data_dir: Path | None = APP_ROOT / _data_dir_name(periods)
+        name = _data_dir_name(periods)
+    else:
+        latest = latest_data_dir()
+        data_dir = APP_ROOT / latest if latest else None
+        name = latest
+    if data_dir is None or not data_dir.exists():
+        where = f" {name}" if name else ""
+        return _check("warn", "模板数据",
+                      f"还没有{where} 的导出数据，请先上传《滚动预测模板表》")
+    issues = check_flow(flow_cfg, form_cfgs, data_dir, check_data=True)
+    warns = [i for i in issues if getattr(i, "level", "") == "warning"]
+    warns += [i for i in csv_dimension_warnings(data_dir)]
+    files, rows = _count_csv_rows(data_dir)
+    detail = f"{name} · {files} 个文件 · 共 {rows} 行"
+    result = _issue_check("模板数据", [i for i in issues if getattr(i, "level", "") == "error"],
+                          f"{detail} · 期间与列校验通过")
+    if result["status"] == "ok" and warns:
+        result = _check("warn", "模板数据", f"{detail}：" + _clip("；".join(str(i) for i in warns)))
+    if result["status"] == "error":
+        result["detail"] = f"{name}：" + result["detail"]
+    return result
+
+
+def check_env(unit: str = "", period: str = "") -> dict:
+    """被动自检：不启动 Excel、不改动任何状态。"""
+    flow_cfg = _load_yaml(FLOW_FILE)
+    form_cfgs = _load_form_configs()
+    checks = [
+        _check_runtime(),
+        _check_excel(),
+        _check_navigator(flow_cfg),
+        _check_credentials(),
+        _check_units_env(flow_cfg, unit),
+        _check_flow_config(flow_cfg, form_cfgs),
+        _check_template(flow_cfg, form_cfgs, period),
+    ]
+    return {"checks": checks}
 
 
 # ---------- API ----------
@@ -737,7 +922,8 @@ def api_run_release():
 
 @app.route("/api/env")
 def api_env():
-    return jsonify(check_env())
+    return jsonify(check_env(unit=request.args.get("unit", ""),
+                             period=request.args.get("period", "")))
 
 
 def cleanup_web_dir(max_age_days: int = 30) -> int:

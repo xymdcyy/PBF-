@@ -13,9 +13,19 @@ async function getJSON(url, opts) {
   return res.json();
 }
 
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
 function setStatus(el, text, cls) {
   el.textContent = text;
   el.className = "status" + (cls ? " " + cls : "");
+}
+
+function setRunning(on) {
+  document.body.classList.toggle("is-running", !!on);
 }
 
 function fmt(v) {
@@ -24,6 +34,32 @@ function fmt(v) {
     return v.toLocaleString("zh-CN", { maximumFractionDigits: 4 });
   }
   return String(v);
+}
+
+// ---------- 日志（按行着色） ----------
+
+function logClass(line) {
+  if (/失败|错误|异常|Traceback|ERROR/i.test(line)) return "lerr";
+  if (/警告|WARNING/i.test(line)) return "lwarn";
+  if (/完成|成功|已保存|已刷新|✓/.test(line)) return "lok";
+  if (/^\s*\[Web\]/.test(line)) return "linfo";
+  return "";
+}
+
+function appendLog(text) {
+  if (!text) return;
+  const log = $("log");
+  const html = text.split("\n").map((ln) => {
+    const cls = logClass(ln);
+    const safe = esc(ln);
+    return cls ? `<span class="${cls}">${safe}</span>` : safe;
+  }).join("\n");
+  log.insertAdjacentHTML("beforeend", html);
+  log.scrollTop = log.scrollHeight;
+}
+
+function clearLog() {
+  $("log").innerHTML = "";
 }
 
 // ---------- 初始化 ----------
@@ -70,7 +106,60 @@ async function init() {
   }
 
   // 期间
-  $("period").value = INIT.suggested_period || INIT.latest_data_dir.replace("data_", "");
+  setupPeriodSelects();
+}
+
+// ---------- 期间选择 ----------
+
+function addMonths(y, mo, delta) {
+  const total = y * 12 + (mo - 1) + delta;
+  return [Math.floor(total / 12), (total % 12) + 1];
+}
+
+function setupPeriodSelects() {
+  const dir = (INIT.latest_data_dir || "").replace(/^data_/, "");
+  const parts = dir.split("_").filter(Boolean);
+  let start = parts[0] || INIT.suggested_period || "";
+  let end = parts[parts.length - 1] || start;
+
+  const m = /^(\d{4})\.(\d{2})$/.exec(start);
+  const today = new Date();
+  let y = m ? Number(m[1]) : today.getFullYear();
+  let mo = m ? Number(m[2]) : today.getMonth() + 1;
+
+  // 候选项：最新期间前 6 个月 ~ 后 12 个月（共 19 个月）
+  const months = [];
+  let [cy, cm] = addMonths(y, mo, -6);
+  for (let i = 0; i < 19; i++) {
+    months.push(`${cy}.${String(cm).padStart(2, "0")}`);
+    [cy, cm] = addMonths(cy, cm, 1);
+  }
+
+  const startSel = $("period-start");
+  const endSel = $("period-end");
+  for (const mon of months) {
+    startSel.insertAdjacentHTML("beforeend", `<option value="${mon}">${mon}</option>`);
+    endSel.insertAdjacentHTML("beforeend", `<option value="${mon}">${mon}</option>`);
+  }
+  if (start) startSel.value = start;
+  if (end) endSel.value = end;
+  syncPeriodEnd();
+  startSel.addEventListener("change", syncPeriodEnd);
+}
+
+// 结束期间不能早于起始期间
+function syncPeriodEnd() {
+  const start = $("period-start").value;
+  const endSel = $("period-end");
+  for (const opt of endSel.options) opt.disabled = opt.value < start;
+  if (!endSel.value || endSel.value < start) endSel.value = start;
+}
+
+// 生成传给后端的期间描述：单个 2026.12 / 区间 2026.11-2026.12
+function periodSpec() {
+  const start = $("period-start").value;
+  const end = $("period-end").value || start;
+  return start === end ? start : `${start}-${end}`;
 }
 
 // ---------- 账号 ----------
@@ -98,110 +187,172 @@ $("btn-save-cred").addEventListener("click", async () => {
   if (r.ok) INIT.password_set = true;
 });
 
+// ---------- 文件选择 ----------
+
+$("file").addEventListener("change", () => {
+  const f = $("file").files[0];
+  $("file-name").textContent = f
+    ? `${f.name} · ${(f.size / 1024).toFixed(0)} KB` : "";
+  $("dropzone").classList.toggle("has-file", !!f);
+});
+
+(() => {
+  // 拖拽上传：把拖入的文件塞进原生 input，触发 change
+  const dz = $("dropzone");
+  ["dragenter", "dragover"].forEach((ev) =>
+    dz.addEventListener(ev, (e) => {
+      e.preventDefault();
+      dz.classList.add("dragover");
+    }));
+  ["dragleave", "drop"].forEach((ev) =>
+    dz.addEventListener(ev, (e) => {
+      e.preventDefault();
+      dz.classList.remove("dragover");
+    }));
+  dz.addEventListener("drop", (e) => {
+    if (e.dataTransfer.files.length) {
+      $("file").files = e.dataTransfer.files;
+      $("file").dispatchEvent(new Event("change"));
+    }
+  });
+})();
+
 // ---------- 上传 ----------
 
 $("btn-upload").addEventListener("click", async () => {
   const file = $("file").files[0];
   if (!file) {
-    $("upload-result").textContent = "请先选择《滚动预测模板表.xlsx》";
+    $("upload-result").innerHTML = '<div class="note bad">请先选择《滚动预测模板表》</div>';
     return;
   }
-  const period = $("period").value.trim();
+  const period = periodSpec();
   const fd = new FormData();
   fd.append("file", file);
   fd.append("period", period);
 
-  $("upload-result").textContent = "正在导出…";
-  const r = await getJSON("/api/upload", { method: "POST", body: fd });
+  $("btn-upload").disabled = true;
+  $("upload-result").innerHTML = '<div class="note">正在导出…</div>';
+  let r;
+  try {
+    r = await getJSON("/api/upload", { method: "POST", body: fd });
+  } catch (e) {
+    $("upload-result").innerHTML =
+      '<div class="note bad">导出失败：网络异常</div>';
+    return;
+  } finally {
+    $("btn-upload").disabled = false;
+  }
   if (!r.ok) {
-    $("upload-result").textContent = "导出失败：" + (r.error || "");
+    $("upload-result").innerHTML =
+      `<div class="note bad">导出失败：${esc(r.error || "")}</div>`;
     return;
   }
   uploadedPeriod = period;
   hasUploaded = true;
-  const lines = Object.entries(r.rows).map(([k, v]) => `  ${k}: ${v} 行`);
-  let text = `导出成功，共 ${r.total} 行 → ${r.data_dir}/\n` + lines.join("\n");
+  const lines = Object.entries(r.rows)
+    .map(([k, v]) => `<li>${esc(k)}：<b>${esc(v)}</b> 行</li>`)
+    .join("");
+  let html = '<div class="note ok">' +
+    `<div class="note-title">导出成功 · 共 ${esc(r.total)} 行</div>` +
+    `<div class="note-dir">→ ${esc(r.data_dir)}/</div>` +
+    (lines ? `<ul>${lines}</ul>` : "");
   if (r.warnings && r.warnings.length) {
-    text += "\n⚠ " + r.warnings.join("\n⚠ ");
+    html += `<ul>${r.warnings.map((w) => `<li>⚠ ${esc(w)}</li>`).join("")}</ul>`;
   }
-  $("upload-result").textContent = text;
+  html += "</div>";
+  $("upload-result").innerHTML = html;
   $("btn-run").disabled = false;
 });
 
 // ---------- 环境自检 ----------
 
 $("btn-env").addEventListener("click", async () => {
-  $("env-result").textContent = "检测中…";
-  const r = await getJSON("/api/env");
-  const lines = r.checks.map((c) => `${c.ok ? "✓" : "✗"} ${c.label}: ${c.detail}`);
-  $("env-result").textContent = lines.join("\n");
+  $("btn-env").disabled = true;
+  $("env-result").innerHTML = '<div class="note">检测中…</div>';
+  const qs = new URLSearchParams({
+    unit: $("unit").value || "",
+    period: periodSpec(),
+  });
+  let r;
+  try {
+    r = await getJSON(`/api/env?${qs}`);
+  } catch (e) {
+    $("env-result").innerHTML = '<div class="note bad">检测失败：网络异常</div>';
+    return;
+  } finally {
+    $("btn-env").disabled = false;
+  }
+  const items = r.checks.map((c) => {
+    const status = c.status || (c.ok ? "ok" : "bad");
+    const icon = status === "ok" ? "✓" : (status === "warn" ? "!" : "✗");
+    return `<div class="env-item ${status}">` +
+      `<span class="env-icon">${icon}</span>` +
+      `<span class="env-label">${esc(c.label)}</span>` +
+      `<span class="env-detail">${esc(c.detail)}</span></div>`;
+  }).join("");
+  $("env-result").innerHTML = `<div class="env-grid">${items}</div>`;
 });
 
 // ---------- 运行 ----------
 
-$("btn-run").addEventListener("click", async () => {
-  const period = $("period").value.trim();
+function runParams() {
+  const period = periodSpec();
   const verKey = $("version").value;
   const verDisplay = INIT.versions.find((v) => v.key === verKey)?.display || "";
-  const body = {
+  return {
     period,
     unit: $("unit").value,
     version_key: verKey,
     version_display: verDisplay,
     switch_version: $("switch-version").checked && !!verKey,
   };
-  const r = await getJSON("/api/run", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) {
-    setStatus($("run-status"), "启动失败：" + (r.error || ""), "err");
-    if ((r.error || "").includes("槽位")) $("btn-release").style.display = "";
-    return;
-  }
-  currentRunId = r.run_id;
-  $("log").textContent = "";
-  $("result").innerHTML = "";
+}
+
+function enterRunning(label) {
+  clearLog();
+  $("result").innerHTML = '<div class="empty">运行中，结束后显示损益核对结果</div>';
   $("btn-run").disabled = true;
   $("btn-clear").disabled = true;
   $("btn-release").style.display = "none";
   $("btn-cancel").disabled = false;
-  setStatus($("run-status"), "运行中…", "");
+  setStatus($("run-status"), label, "running");
+  setRunning(true);
+}
+
+function handleStartError(r, prefix) {
+  setStatus($("run-status"), prefix + (r.error || ""), "err");
+  if ((r.error || "").includes("槽位")) $("btn-release").style.display = "";
+}
+
+$("btn-run").addEventListener("click", async () => {
+  const r = await getJSON("/api/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(runParams()),
+  });
+  if (!r.ok) {
+    handleStartError(r, "启动失败：");
+    return;
+  }
+  currentRunId = r.run_id;
+  enterRunning("运行中…");
   pollLog(0);
 });
 
 // ---------- 批量清除 ----------
 
 $("btn-clear").addEventListener("click", async () => {
-  const period = $("period").value.trim();
-  const verKey = $("version").value;
-  const verDisplay = INIT.versions.find((v) => v.key === verKey)?.display || "";
-  const body = {
-    period,
-    unit: $("unit").value,
-    version_key: verKey,
-    version_display: verDisplay,
-    switch_version: $("switch-version").checked && !!verKey,
-  };
   const r = await getJSON("/api/clear", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(runParams()),
   });
   if (!r.ok) {
-    setStatus($("run-status"), "清除启动失败：" + (r.error || ""), "err");
-    if ((r.error || "").includes("槽位")) $("btn-release").style.display = "";
+    handleStartError(r, "清除启动失败：");
     return;
   }
   currentRunId = r.run_id;
-  $("log").textContent = "";
-  $("result").innerHTML = "";
-  $("btn-run").disabled = true;
-  $("btn-clear").disabled = true;
-  $("btn-release").style.display = "none";
-  $("btn-cancel").disabled = false;
-  setStatus($("run-status"), "清除运行中…", "");
+  enterRunning("清除运行中…");
   pollLog(0);
 });
 
@@ -212,12 +363,10 @@ function pollLog(offset) {
       setStatus($("run-status"), "日志读取失败：" + (r.error || ""), "err");
       return;
     }
-    if (r.lines) {
-      $("log").textContent += r.lines;
-      $("log").scrollTop = $("log").scrollHeight;
-    }
+    appendLog(r.lines || "");
     if (r.done) {
       $("btn-cancel").disabled = true;
+      setRunning(false);
       if (r.stuck) {
         // 取消/超时后 Excel 未确认退出：槽位仍被占用，先别放行新流程
         $("btn-release").style.display = "";
@@ -243,36 +392,44 @@ function pollLog(offset) {
 async function loadResult() {
   const r = await getJSON(`/api/run/${currentRunId}/result`);
   if (!r.ok || !r.report) {
-    $("result").textContent = "（无损益核对结果）";
+    $("result").innerHTML =
+      '<div class="empty">（无损益核对结果）</div>';
     return;
   }
   if (r.report.locked) {
-    $("result").textContent = r.report.locked.message || "表单被锁定，流程已中止";
+    $("result").innerHTML =
+      `<div class="note bad">${esc(r.report.locked.message || "表单被锁定，流程已中止")}</div>`;
     return;
   }
   if (!r.report.indicators) {
-    $("result").textContent = "（无损益核对结果）";
+    $("result").innerHTML =
+      '<div class="empty">（无损益核对结果）</div>';
     return;
   }
   const ind = r.report.indicators;
   const names = Object.keys(ind);
   const periods = [...new Set(names.flatMap((n) => Object.keys(ind[n])))];
-  let html = '<table class="result"><thead><tr><th>指标</th>';
-  for (const p of periods) html += `<th>${p}</th>`;
+  let html = '<div class="table-scroll"><table class="result"><thead><tr><th>指标</th>';
+  for (const p of periods) html += `<th>${esc(p)}</th>`;
   html += "</tr></thead><tbody>";
   for (const n of names) {
-    html += `<tr><td>${n}</td>`;
-    for (const p of periods) html += `<td>${fmt(ind[n][p])}</td>`;
+    html += `<tr><td>${esc(n)}</td>`;
+    for (const p of periods) {
+      const v = ind[n][p];
+      const num = typeof v === "number";
+      const cls = "num" + (num && v < 0 ? " neg" : (num && v > 0 ? " pos" : ""));
+      html += `<td class="${cls}">${esc(fmt(v))}</td>`;
+    }
     html += "</tr>";
   }
-  html += "</tbody></table>";
+  html += "</tbody></table></div>";
   $("result").innerHTML = html;
 }
 
 $("btn-cancel").addEventListener("click", async () => {
   if (!currentRunId) return;
   const r = await getJSON(`/api/run/${currentRunId}/cancel`, { method: "POST" });
-  setStatus($("run-status"), r.note || "已请求取消", "");
+  setStatus($("run-status"), r.note || "已请求取消", "running");
 });
 
 $("btn-release").addEventListener("click", async () => {
@@ -284,6 +441,7 @@ $("btn-release").addEventListener("click", async () => {
   $("btn-release").style.display = "none";
   $("btn-run").disabled = !hasUploaded;
   $("btn-clear").disabled = false;
+  setRunning(false);
   setStatus($("run-status"), r.note || "已释放运行槽位", "ok");
 });
 
