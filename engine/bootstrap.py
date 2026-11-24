@@ -222,9 +222,25 @@ def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False,
             log.warning(f"AO 会话失效，结束旧 Excel PID={stale_pid} 以重建会话…")
             kill_excel(stale_pid)
         elif running:
+            # 旧 PID 不在了但有其它 Excel 进程：要么旧 Excel 已死、要么 PID 记录
+            # 丢了。Excel 是单实例，Dispatch 只会连上现有进程——导航表还开着就
+            # 说明死会话的实例还活着，不结束它"重启"只是空转，后续宏照旧报
+            # 0x800A9C68。宁可报错让用户手动关，也不悄悄复用死会话。
+            has_nav = False
+            try:
+                probe = ExcelEngine(timeout_sec=3)
+                probe.find_workbook(pattern)
+                has_nav = True
+            except ExcelError:
+                has_nav = False
+            if has_nav:
+                raise ExcelError(
+                    f"AO 会话失效，但未能定位旧 Excel PID（目标 PID={stale_pid}），"
+                    "而导航表仍开着——死会话的 Excel 还在运行。为避免误杀用户其它 "
+                    "Excel 没有强制结束；请手动关闭该 Excel 后重试")
             log.warning(
-                f"AO 会话失效，但未能定位旧 Excel PID（目标 PID={stale_pid}）；"
-                "为避免影响其它 Excel 不强制结束，恢复可能失败，请手动关闭该 Excel")
+                f"AO 会话失效，未能定位旧 Excel PID（目标 PID={stale_pid}）；"
+                "导航表未开（旧实例可能已退出），按新会话重新启动")
 
     # 1) 已经就绪（真实 Excel 里导航表已打开）——仅当确有 Excel 进程时才去连，
     #    否则 ExcelEngine 的 Dispatch 会拉起一个空 Excel，还得再关掉，反而制造竞态。

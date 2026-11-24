@@ -315,15 +315,40 @@ class MeasureBlockHeaderTests(unittest.TestCase):
             {"AK57", "AR57", "AY57"},          # 2027.02：单价/销量/加权CT
         )
 
-    def test_falls_back_to_config_when_header_missing(self) -> None:
+    def test_unreadable_headers_raise_instead_of_fallback(self) -> None:
+        # 表头读不到（表单未加载/行号配错）时直接报错，绝不回退配置列：
+        # 模板块宽随版本期间窗口变（6↔7 列），配置列可能已与模板错位，
+        # 硬写配置列会把数字写进错误的度量/期间——宁可中止也不能写错。
         engine = FakeEngine()
         writer = FormWriter(engine, MEASURE_CFG)
-        pf = writer.preflight([self.ROW])
-        self.assertTrue(pf.ok, pf.checks)
-        self.assertEqual(
-            {r["cell"] for r in pf.matched_rows},
-            {"AK57", "AQ57", "AW57"},          # 旧的 6 列配置兜底
-        )
+        with self.assertRaises(ExcelError) as ctx:
+            writer.preflight([self.ROW])
+        self.assertIn("度量块表头识别失败", str(ctx.exception))
+        self.assertEqual(engine.write_calls, [])   # 一个字都不能写
+
+    def test_partial_headers_raise_instead_of_fallback(self) -> None:
+        # 只有部分度量块有表头（销售收入块缺失）→ 报错，不能拿配置列补写
+        cells = self._seven_col_headers()
+        for col in ("BC", "BD", "BE", "BF", "BG", "BH", "BI"):
+            cells.pop(f"{col}55", None)
+            cells.pop(f"{col}56", None)
+        engine = FakeEngine(cells)
+        writer = FormWriter(engine, MEASURE_CFG)
+        with self.assertRaises(ExcelError) as ctx:
+            writer.preflight([self.ROW])
+        self.assertIn("销售收入", str(ctx.exception))
+        self.assertEqual(engine.write_calls, [])
+
+    def test_inconsistent_block_widths_raise(self) -> None:
+        # 某个度量块的期间数与其它块不一致（合并单元格/空列的典型症状）→ 报错
+        cells = self._seven_col_headers()
+        cells.pop("BI55")      # 销售收入块少一个期间（只剩 6 个）
+        cells.pop("BI56")
+        engine = FakeEngine(cells)
+        writer = FormWriter(engine, MEASURE_CFG)
+        with self.assertRaises(ExcelError) as ctx:
+            writer.preflight([self.ROW])
+        self.assertIn("期间数不一致", str(ctx.exception))
 
     def test_detected_periods_are_used_for_coverage_check(self) -> None:
         engine = FakeEngine(self._seven_col_headers())

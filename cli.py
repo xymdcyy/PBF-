@@ -508,8 +508,10 @@ def cmd_clear(args) -> None:
         from types import SimpleNamespace
         rf_args = SimpleNamespace(
             data_dir=str(out_dir), skip_fill=False, only_verify=False,
-            from_step=None, version=None, preflight_only=False,
-            version_key=None, unit=getattr(args, "unit", None),
+            from_step=None, version=getattr(args, "version", None),
+            preflight_only=False,
+            version_key=getattr(args, "version_key", None),
+            unit=getattr(args, "unit", None),
             report_file=getattr(args, "report_file", None),
             clear_mode=True)   # 清 0 后损益指标全 0 属预期，核对放行
         cmd_run_flow(rf_args)
@@ -831,6 +833,9 @@ def build_parser() -> argparse.ArgumentParser:
     cl.add_argument("--out-dir", help="输出目录，默认 data_<首>_<末>_clear")
     cl.add_argument("--run", action="store_true", help="生成后接着运行 run-flow 填 0")
     cl.add_argument("--unit", help="业务单元（品牌×品类），配合 --run 使用")
+    cl.add_argument("--version", help="run-flow 期望版本子串（配合 --run）")
+    cl.add_argument("--version-key",
+                    help="run-flow 切换的版本成员键，如 C03202611V2（配合 --run）")
     cl.add_argument("--report-file", help="run-flow 结果 JSON 路径（配合 --run）")
 
     un = sub.add_parser("units", help="列出并校验业务单元（品牌×品类）配置")
