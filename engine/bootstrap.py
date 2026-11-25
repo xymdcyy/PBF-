@@ -654,11 +654,14 @@ def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False,
             # 登录框关闭后加载项会自动刷新所有数据源；它没刷完就切版本会把
             # 加载项打崩（现场 15:23 的「SAP BI 加载项已断开所有数据源连接」）。
             # 只在本次真的填过登录框时等，复用已有会话不额外拖延。
+            # 必须先 _mark_login 再 settle：屏障完成要落在 login_settled=True
+            # 上，先 settle 后 mark 会把标志清回 False，run_flow 会重复等一遍。
+            mark = _mark_login(engine, launched_now=opened_now,
+                               login_handle=login_handle)
             if (login_handle is not None and login_handle.outcome
                     and getattr(login_handle, "saw_box", False)):
-                wait_ao_login_idle(engine, flow_cfg)
-            return _mark_login(engine, launched_now=opened_now,
-                               login_handle=login_handle)
+                wait_ao_login_idle(mark, flow_cfg)
+            return mark
         except ExcelError:
             continue
     raise ExcelError(f"等待导航表打开超时（{wait_sec}s）")
