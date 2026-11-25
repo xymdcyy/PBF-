@@ -200,7 +200,7 @@ def _sleep_cancellable(seconds: float) -> None:
         time.sleep(min(1.0, left))
 
 
-def _wait_ao_login_idle(engine: ExcelEngine, flow_cfg: dict) -> None:
+def wait_ao_login_idle(engine: ExcelEngine, flow_cfg: dict) -> None:
     """等登录后 AO 自动刷新收尾，再让调用方去切版本/跑宏。
 
     只做普通 Excel 调用（Workbooks.Count），不碰 AO 变量——加载项正在刷新时
@@ -219,10 +219,7 @@ def _wait_ao_login_idle(engine: ExcelEngine, flow_cfg: dict) -> None:
     else:
         log.warning("等待 AO 刷新收尾超时（%.0fs），仍继续；若随后报加载项断连，"
                     "请在 Excel 里点「重新启动」或手动切换版本", timeout)
-    try:
-        engine.login_settled = True
-    except Exception:
-        pass
+    engine.login_settled = True
 
 
 def excel_pids() -> list[int]:
@@ -435,10 +432,14 @@ def _mark_login(engine: ExcelEngine, launched_now: bool, login_done: bool = Fals
                    成功信号才能置 True；后台线程"已启动/已结束"不算数，
                    失败 outcome 由 run_flow 消费后给出明确报错。
     login_handle:  后台登录线程的结果句柄（未起线程时为 None）。
+    login_settled: 登录后的 AO 收尾屏障（wait_ao_login_idle）是否已做过；
+                   复用 Excel 的路径在 bootstrap 里只起线程不等结果，屏障
+                   由 run_flow/recover 补，靠这个标志防止重复等待。
     """
     engine.launched_now = launched_now
     engine.login_done = login_done
     engine.login_handle = login_handle
+    engine.login_settled = False
     return engine
 
 
@@ -655,7 +656,7 @@ def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False,
             # 只在本次真的填过登录框时等，复用已有会话不额外拖延。
             if (login_handle is not None and login_handle.outcome
                     and getattr(login_handle, "saw_box", False)):
-                _wait_ao_login_idle(engine, flow_cfg)
+                wait_ao_login_idle(engine, flow_cfg)
             return _mark_login(engine, launched_now=opened_now,
                                login_handle=login_handle)
         except ExcelError:

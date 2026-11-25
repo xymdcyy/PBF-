@@ -229,7 +229,7 @@ class EnsureExcelReadyBindingTest(unittest.TestCase):
         # 登录框关闭后加载项还在自动刷新，直接切版本会把它打崩——必须等收尾
         engine, calls, popen, handle = self._install_fakes(already_open=False)
         handle.saw_box = True
-        with mock.patch.object(self.bs, "_wait_ao_login_idle") as settle:
+        with mock.patch.object(self.bs, "wait_ao_login_idle") as settle:
             self.bs.ensure_excel_ready(self.flow_cfg, wait_sec=20)
         settle.assert_called_once_with(engine, self.flow_cfg)
 
@@ -250,7 +250,7 @@ class EnsureExcelReadyBindingTest(unittest.TestCase):
 
         handle = _FakeLoginHandle()
         handle.saw_box = True       # 即便后台守候线程填过登录框，也不在复用路径等刷新
-        settle_patch = mock.patch.object(bs, "_wait_ao_login_idle")
+        settle_patch = mock.patch.object(bs, "wait_ao_login_idle")
         patches = [
             mock.patch.object(bs, "ExcelEngine", FakeExcelEngine),
             mock.patch.object(bs, "excel_pids", return_value=[engine.pid]),

@@ -23,7 +23,7 @@ import pandas as pd
 import yaml
 
 from .excel import ExcelEngine, ExcelError, is_disconnect
-from .bootstrap import ensure_excel_ready, launch_no_box_ok_sec
+from .bootstrap import ensure_excel_ready, launch_no_box_ok_sec, wait_ao_login_idle
 from .cancel import CancelledError, is_cancelled, raise_if_cancelled
 from .header_periods import normalize_period_header
 from .navigator import Navigator
@@ -426,27 +426,31 @@ class PbfFlow:
         login_cfg = login_config(self.cfg)
         # 启动阶段的后台登录线程以结果句柄为准：成功才跳过登录，
         # 失败/未确认都要在这里重新同步登录，不能把"线程已结束"当已登录
-        handle = getattr(self.engine, "login_handle", None)
-        if handle is not None and not handle.finished:
-            handle.wait(float(login_cfg.get("timeout", 120)) + 30)
-        login_confirmed = bool(getattr(self.engine, "login_done", False)) or (
-            handle is not None and handle.finished and bool(handle.outcome))
+        login_confirmed = bool(getattr(self.engine, "login_done", False)) or \
+            await_background_login(self.engine, self.cfg,
+                                   float(login_cfg.get("timeout", 120)) + 30)
         if login_cfg.get("username") and not login_confirmed:
             from .ao_login import AoLogin
 
             launched = bool(getattr(self.engine, "launched_now", False))
-            ok = AoLogin(
+            login = AoLogin(
                 username=login_cfg["username"],
                 password=login_cfg.get("password", ""),
                 client=str(login_cfg.get("client", "333")),
                 lang=str(login_cfg.get("lang", "zh")),
-            ).ensure(float(login_cfg.get("timeout", 120)),
-                     expect_login=launched,
-                     no_box_ok_after=launch_no_box_ok_sec(self.cfg) if launched else None)
+            )
+            ok = login.ensure(float(login_cfg.get("timeout", 120)),
+                              expect_login=launched,
+                              no_box_ok_after=launch_no_box_ok_sec(self.cfg) if launched else None)
             if not ok:
                 log.error("恢复后自动登录失败（已停止自动重试，避免账号锁定），"
                           "请在 Excel 中手动登录后重试")
                 return False
+            if getattr(login, "saw_login_box", False) \
+                    and not getattr(self.engine, "login_settled", False):
+                # 同步登录真的填过登录框：加载项随后会自动刷新数据源，
+                # 等它收尾再继续（同 wait_ao_login_idle 的屏障）
+                wait_ao_login_idle(self.engine, self.cfg)
         elif login_confirmed:
             log.info("启动阶段已处理 AO 登录，恢复流程跳过重复登录")
         # AO 刚登录完导航表还在加载，等它可读再交还给调用方
@@ -1170,6 +1174,36 @@ def close_form_workbooks_on_cancel(engine: ExcelEngine, form_cfgs: dict,
     return closed
 
 
+def await_background_login(engine: ExcelEngine, flow_cfg: dict,
+                           wait_sec: float) -> bool:
+    """分片等待启动阶段的后台登录线程出结果；确认成功后补 AO 收尾屏障。
+
+    之前是单次 handle.wait(timeout + 30)：最长阻塞 150s 且中途不检查取消
+    标志，Web 端取消只能干等宽限期后被硬杀进程树。改为按秒分片，取消一
+    出现就抛 CancelledError 走安全点收尾。
+
+    登录确认成功且线程真的填过登录框时，AO 加载项会自动刷新数据源（实测
+    占住 UI 线程 30s 级），必须等它收尾才能继续调 SAP 变量——复用 Excel 的
+    路径在 bootstrap 里只起线程不等结果，屏障就补在这里。login_settled
+    防止 bootstrap 已做过的屏障重复执行。
+    """
+    handle = getattr(engine, "login_handle", None)
+    if handle is not None and not handle.finished:
+        deadline = time.time() + max(wait_sec, 0.0)
+        while True:
+            raise_if_cancelled()
+            if handle.wait(timeout=1) is not None:
+                break
+            if time.time() >= deadline:
+                break
+    confirmed = bool(handle is not None and handle.finished
+                     and bool(handle.outcome))
+    if confirmed and getattr(handle, "saw_box", False) \
+            and not getattr(engine, "login_settled", False):
+        wait_ao_login_idle(engine, flow_cfg)
+    return confirmed
+
+
 def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Path,
              skip_fill: bool = False, only_verify: bool = False,
              expected_version: Optional[str] = None,
@@ -1213,9 +1247,8 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
         # 不能拿"线程已启动/已结束"当成功——密码错误时线程照样退出，
         # 若被当成已登录，后续 COM 调用会被模态登录框永久阻塞
         handle = getattr(engine, "login_handle", None)
-        if handle is not None and not handle.finished:
-            handle.wait(float(login_cfg.get("timeout", 60)) + 30)
-        if handle is not None and handle.finished and handle.outcome:
+        if await_background_login(engine, flow_cfg,
+                                  float(login_cfg.get("timeout", 60)) + 30):
             log.info("启动阶段后台登录已成功，跳过重复登录")
             report["login"] = True
         else:
@@ -1229,20 +1262,26 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
                     "请在 Excel 中手动登录后重试")
             from .ao_login import AoLogin
             launched = bool(getattr(engine, "launched_now", False))
-            ok = AoLogin(
+            login = AoLogin(
                 username=login_cfg["username"],
                 password=login_cfg.get("password", ""),
                 client=str(login_cfg.get("client", "333")),
                 lang=str(login_cfg.get("lang", "zh")),
-            ).ensure(float(login_cfg.get("timeout", 60)),
-                     # 刚由本工具启动 Excel 时，登录框还没弹出来，必须等它出现；
-                     # 但超过登录宽限仍没有框时按缓存会话继续，不再空等到超时
-                     expect_login=launched,
-                     no_box_ok_after=launch_no_box_ok_sec(flow_cfg) if launched else None)
+            )
+            ok = login.ensure(float(login_cfg.get("timeout", 60)),
+                              # 刚由本工具启动 Excel 时，登录框还没弹出来，必须等它出现；
+                              # 但超过登录宽限仍没有框时按缓存会话继续，不再空等到超时
+                              expect_login=launched,
+                              no_box_ok_after=launch_no_box_ok_sec(flow_cfg) if launched else None)
             if not ok:
                 raise ExcelError(
                     "AO 自动登录失败（已停止自动重试，避免账号锁定），"
                     "请在 Excel 中手动登录后重试")
+            if getattr(login, "saw_login_box", False) \
+                    and not getattr(engine, "login_settled", False):
+                # 同步登录真的填过登录框：加载项随后会自动刷新数据源，
+                # 等它收尾再继续（同 wait_ao_login_idle 的屏障）
+                wait_ao_login_idle(engine, flow_cfg)
             report["login"] = True
 
     rcfg = flow_cfg.get("recovery") or {}

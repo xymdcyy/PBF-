@@ -36,6 +36,21 @@ class RunOwnedPidsTest(unittest.TestCase):
     def test_none_current_means_unknown(self):
         self.assertEqual(run_owned_pids({"excel_pids_before": [100]}, None), set())
 
+    def test_owner_record_pid_counted(self):
+        # 跨进程归属记录里的实例也占槽（pbf/reused 来源都算——它正跑本工具的流程）
+        state = {"excel_pids_before": [100]}
+        self.assertEqual(run_owned_pids(state, [100, 300], owner_pid=300), {300})
+
+    def test_owner_record_counts_despite_baseline(self):
+        # 复用的实例在运行开始前就存在（在基线里），凭归属记录照样计入
+        state = {"excel_pids_before": [100, 300]}
+        self.assertEqual(run_owned_pids(state, [100, 300], owner_pid=300), {300})
+
+    def test_owner_record_dead_pid_dropped(self):
+        # 归属记录指向的进程已退出：与当前进程表求交后自然丢弃
+        state = {"excel_pids_before": [100]}
+        self.assertEqual(run_owned_pids(state, [100], owner_pid=999), set())
+
 
 class ShouldHoldSlotTest(unittest.TestCase):
     def test_alive_proc_holds(self):
@@ -55,6 +70,14 @@ class ShouldHoldSlotTest(unittest.TestCase):
     def test_cancelled_unknown_pids_holds(self):
         self.assertTrue(should_hold_slot({"cancelled": True}, proc_alive=False,
                                          current_pids=None))
+
+    def test_cancelled_holds_while_owner_record_excel_alive(self):
+        # 归属记录里的 Excel（pbf/reused 都算）没退出前占位
+        state = {"cancelled": True, "excel_pids_before": [100]}
+        self.assertTrue(should_hold_slot(state, proc_alive=False,
+                                         current_pids=[100, 300], owner_pid=300))
+        self.assertFalse(should_hold_slot(state, proc_alive=False,
+                                          current_pids=[100], owner_pid=300))
 
     def test_cancelled_graceful_releases_even_with_excel_alive(self):
         # 子进程已在安全点自行退出，Excel 可能还开着导航表，下一轮复用即可

@@ -199,12 +199,26 @@ def _excel_pids_snapshot() -> list[int] | None:
         return None
 
 
+def _excel_owner_pid() -> int | None:
+    """跨进程 Excel 归属记录里的 PID（pbf/reused 来源都算本工具的流程实例）。
+
+    engine.bootstrap.read_excel_owner 自己会校验进程还活着、PID 未被复用；
+    记录无效或 engine 不可导入时返回 None，退化为不并入（只按基线判断）。
+    """
+    try:
+        from engine.bootstrap import read_excel_owner
+        record = read_excel_owner()
+        return int(record["pid"]) if record else None
+    except Exception:
+        return None
+
+
 def _run_owned_excel_alive(state: dict) -> bool:
-    """本次运行启动的 Excel 是否还在运行（用户原有的 Excel 不算）。"""
+    """本次运行"拥有"的 Excel 是否还在运行（用户无关的 Excel 不算）。"""
     pids = _excel_pids_snapshot()
     if pids is None:
         return True              # 无法判断：宁可多占位，不可抢跑
-    return bool(run_owned_pids(state, pids))
+    return bool(run_owned_pids(state, pids, _excel_owner_pid()))
 
 
 def _try_release_stuck_run() -> None:
@@ -426,8 +440,10 @@ def _spawn(params: dict) -> str | None:
             proc_alive = proc is not None and proc.poll() is None
             current_pids = _excel_pids_snapshot()
             state["excel_pids_end"] = current_pids
-            state["excel_owned_pids"] = sorted(run_owned_pids(state, current_pids))
-            hold = should_hold_slot(state, proc_alive, current_pids)
+            owner_pid = _excel_owner_pid()
+            state["excel_owned_pids"] = sorted(
+                run_owned_pids(state, current_pids, owner_pid))
+            hold = should_hold_slot(state, proc_alive, current_pids, owner_pid)
             # 占位时保留 Popen：人工释放接口要确认子进程是否真的退出；
             # 正常结束则清掉引用。
             if not hold:
