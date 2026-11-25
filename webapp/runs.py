@@ -56,12 +56,17 @@ class RunRegistry:
             self._runs.pop(rid, None)
 
 
-def run_owned_pids(state: dict, current_pids) -> set[int]:
+def run_owned_pids(state: dict, current_pids,
+                   owner_pid: int | None = None) -> set[int]:
     """本次运行"拥有"的 Excel PID：运行开始时不在、结束时还在的那些。
 
     之前只要有任何 EXCEL.EXE 就占槽，把用户自己开的 Excel（甚至别的 COM
     客户端开的）也算进来，逼着用户关掉唯一带 AO 会话的实例，反而毁掉会话。
-    归属记录里的 pbf 实例（跨进程持久化）也一并计入。
+    跨进程归属记录（engine 写的 logs/excel_owner.json）里的实例也一并计入，
+    不分 pbf/reused 来源：复用的实例同样在跑本工具的流程，槽位释放只看
+    "这个 Excel 是不是本工具带起来的"。强杀策略是另一回事——只对 pbf 来源
+    的实例自动 Quit/taskkill（见 engine.bootstrap），reused 来源只占槽、
+    不强杀。
     """
     if current_pids is None:
         return set()
@@ -69,10 +74,16 @@ def run_owned_pids(state: dict, current_pids) -> set[int]:
     baseline = {int(p) for p in (state.get("excel_pids_before") or [])}
     owned = {int(p) for p in (state.get("excel_owned_pids") or [])}
     owned |= current - baseline
+    if owner_pid is not None:
+        try:
+            owned.add(int(owner_pid))
+        except (TypeError, ValueError):
+            pass
     return current & owned
 
 
-def should_hold_slot(state: dict, proc_alive: bool, current_pids=None) -> bool:
+def should_hold_slot(state: dict, proc_alive: bool, current_pids=None,
+                     owner_pid: int | None = None) -> bool:
     """取消/超时后是否继续占用运行槽位。
 
     占位的目的：子进程没被确认终止，或**本次运行启动的** Excel 可能还在执行
@@ -83,7 +94,8 @@ def should_hold_slot(state: dict, proc_alive: bool, current_pids=None) -> bool:
     - 正常结束 → 放行。
     - 取消后子进程已在安全点自行退出（cancel_graceful）→ 放行：此时 Excel
       可能还开着导航表，下一轮直接复用即可。
-    - 硬取消/超时 → 只等本次运行启动的 Excel 退出；用户原有的 Excel 不占槽。
+    - 硬取消/超时 → 只等本次运行启动的 Excel 退出；用户原有的、与本次运行
+      无关的 Excel 不占槽（归属记录里的实例除外——它正跑着本工具的流程）。
     """
     if proc_alive:
         return True
@@ -98,7 +110,7 @@ def should_hold_slot(state: dict, proc_alive: bool, current_pids=None) -> bool:
     if current_pids is None:
         # 无法枚举进程：宁可多占一会儿，也不能让两个流程同时操作 Excel
         return True
-    return bool(run_owned_pids(state, current_pids))
+    return bool(run_owned_pids(state, current_pids, owner_pid))
 
 
 def can_force_release(state: dict, proc_alive: bool) -> bool:

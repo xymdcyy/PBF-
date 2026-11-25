@@ -283,7 +283,7 @@ $("btn-env").addEventListener("click", async () => {
     $("btn-env").disabled = false;
   }
   const items = r.checks.map((c) => {
-    const status = c.status || (c.ok ? "ok" : "bad");
+    const status = c.status || (c.ok ? "ok" : "error");
     const icon = status === "ok" ? "✓" : (status === "warn" ? "!" : "✗");
     return `<div class="env-item ${status}">` +
       `<span class="env-icon">${icon}</span>` +

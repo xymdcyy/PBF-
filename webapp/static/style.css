@@ -599,8 +599,8 @@ select option { background: #fff; color: var(--text); }
 .env-item.ok .env-icon { background: #d9f7e9; color: #059669; }
 .env-item.warn { border-color: #fde9b8; background: #fffdf5; }
 .env-item.warn .env-icon { background: #fef3c7; color: #b45309; }
-.env-item.bad { border-color: #fbd5da; background: #fff8f9; }
-.env-item.bad .env-icon { background: #ffe4e6; color: var(--red); }
+.env-item.error { border-color: #fbd5da; background: #fff8f9; }
+.env-item.error .env-icon { background: #ffe4e6; color: var(--red); }
 
 .env-label { color: var(--text); font-weight: 600; }
 .env-detail { color: var(--faint); font-size: 12px; }

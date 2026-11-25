@@ -199,12 +199,40 @@ def _excel_pids_snapshot() -> list[int] | None:
         return None
 
 
+def _excel_owner_pid(since_ts: float | None = None) -> int | None:
+    """跨进程 Excel 归属记录里的 PID（pbf/reused 来源都算本工具的流程实例）。
+
+    engine.bootstrap.read_excel_owner 自己会校验进程还活着、PID 未被复用；
+    记录无效或 engine 不可导入时返回 None，退化为不并入（只按基线判断）。
+
+    since_ts（本次运行开始时间）：只并入本轮运行期间写过的记录。正常运行
+    只要走到 ensure_excel_ready，_record_owner 在所有路径上都会重写记录；
+    记录时间戳早于本次运行开始，说明这个 Excel 是上一轮的残留、本次运行
+    还没碰过它——与本次运行无关的实例不占槽，避免取消/超时后槽位被它
+    长期占住（等用户关 Excel 才放行）。
+    """
+    try:
+        from engine.bootstrap import owner_file, read_excel_owner
+        record = read_excel_owner()
+        if not record:
+            return None
+        if since_ts is not None:
+            try:
+                if owner_file().stat().st_mtime < since_ts:
+                    return None
+            except OSError:
+                return None
+        return int(record["pid"])
+    except Exception:
+        return None
+
+
 def _run_owned_excel_alive(state: dict) -> bool:
-    """本次运行启动的 Excel 是否还在运行（用户原有的 Excel 不算）。"""
+    """本次运行"拥有"的 Excel 是否还在运行（用户无关的 Excel 不算）。"""
     pids = _excel_pids_snapshot()
     if pids is None:
         return True              # 无法判断：宁可多占位，不可抢跑
-    return bool(run_owned_pids(state, pids))
+    return bool(run_owned_pids(state, pids, _excel_owner_pid(state.get("started"))))
 
 
 def _try_release_stuck_run() -> None:
@@ -426,8 +454,10 @@ def _spawn(params: dict) -> str | None:
             proc_alive = proc is not None and proc.poll() is None
             current_pids = _excel_pids_snapshot()
             state["excel_pids_end"] = current_pids
-            state["excel_owned_pids"] = sorted(run_owned_pids(state, current_pids))
-            hold = should_hold_slot(state, proc_alive, current_pids)
+            owner_pid = _excel_owner_pid(state["started"])
+            state["excel_owned_pids"] = sorted(
+                run_owned_pids(state, current_pids, owner_pid))
+            hold = should_hold_slot(state, proc_alive, current_pids, owner_pid)
             # 占位时保留 Popen：人工释放接口要确认子进程是否真的退出；
             # 正常结束则清掉引用。
             if not hold:
