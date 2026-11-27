@@ -25,7 +25,7 @@ ROOT = app_root()
 def _default_template() -> Path:
     candidates = [
         ROOT / "滚动预测模板表.xlsx",
-        Path("C:/Users/jiang5.zhou/Desktop/AR项目/滚动预测模板表.xlsx"),
+        Path("/Users/yimingxu/Desktop/AR项目/滚动预测模板表.xlsx"),
     ]
     for c in candidates:
         if c.exists():

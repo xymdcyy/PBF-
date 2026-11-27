@@ -50,7 +50,7 @@ navigator:
   bw_nav_title: "PBF Pro - 全面预算系统流程导航"
   workbook_pattern: "PBF Pro - 全面预算系统流程导航*"
   sheet: "PBF Pro - 全面预算系统流程导航"
-  launch_file: "D:\\代码\\PBF自动工具\\pbf-uploader\\PBF Pro - 全面预算系统流程导航.xlsb"
+  launch_file: "/Users/yimingxu/Dev/PBF自动工具/pbf-uploader/PBF Pro - 全面预算系统流程导航.xlsb"
   version_cell: "AR45"                 # 版本显示，如"滚动预测2026年11月月初版"
   refresh_flow_macro: "Refresh_Status"  # "刷新流程"按钮 Button 9
   open_button_cell: "AT52"             # 选中业务单元行后，AT52 变为"打开"

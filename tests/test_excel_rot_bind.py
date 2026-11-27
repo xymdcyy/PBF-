@@ -19,7 +19,7 @@ import _stubs  # noqa: F401
 import engine.excel as ex
 from engine.excel import ExcelEngine, ExcelError
 
-NAV = r"D:\代码\PBF自动工具\pbf-uploader\PBF Pro - 全面预算系统流程导航.xlsb"
+NAV = r"/Users/yimingxu/Dev/PBF自动工具/pbf-uploader/PBF Pro - 全面预算系统流程导航.xlsb"
 
 
 class RotPathTest(unittest.TestCase):
@@ -31,7 +31,7 @@ class RotPathTest(unittest.TestCase):
 
     def test_other_workbooks_do_not_match(self):
         with mock.patch.object(ExcelEngine, "_rot_display_names",
-                               return_value=[r"D:\代码\PBF自动工具\pbf-uploader\其他表.xlsb"]):
+                               return_value=[r"/Users/yimingxu/Dev/PBF自动工具/pbf-uploader/其他表.xlsb"]):
             self.assertFalse(ExcelEngine.is_workbook_open(NAV))
 
     def test_non_file_monikers_are_ignored(self):
