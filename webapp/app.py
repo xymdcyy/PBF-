@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 import yaml
 from flask import Flask, jsonify, render_template, request
 
-from paths import app_root
+from paths import app_root, has_unresolved_var, resolve_path
 from data_dirs import latest_data_dir as find_latest_data_dir
 from engine.business_units import (UnitError, check_units,
                                    csv_dimension_warnings, default_unit, get_unit)
@@ -588,9 +588,13 @@ def _check_navigator(flow_cfg: dict) -> dict:
     if source == "file" or launch:
         if not launch:
             return _check("error", "导航表", "flow.yaml 未配置 navigator.launch_file")
-        if Path(launch).exists():
-            return _check("ok", "导航表", f"导航表就绪：{Path(launch).name}")
-        return _check("error", "导航表", f"导航表不存在：{launch}")
+        if has_unresolved_var(launch):
+            return _check("error", "导航表",
+                          f"导航表路径里的环境变量未设置：{launch}（如 PBF_NAV_FILE）")
+        nav_path = resolve_path(launch)
+        if nav_path.exists():
+            return _check("ok", "导航表", f"导航表就绪：{nav_path.name}")
+        return _check("error", "导航表", f"导航表不存在：{nav_path}")
     if nav.get("bw_connection"):
         return _check("ok", "导航表", f"BW 连接已配置：{nav.get('bw_connection')}")
     return _check("warn", "导航表", "未配置 launch_file / bw_connection，将使用默认连接")

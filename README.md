@@ -80,12 +80,19 @@ python cli.py export --template 滚动预测模板表.xlsx --periods 2027.01-202
 
 ### 2.3 确认导航表路径
 
-`config/flow.yaml` 中：
+导航表路径跟机器绑定，不写进仓库，用环境变量 `PBF_NAV_FILE` 指定：
 
-```yaml
-navigator:
-  launch_file: "C:\\Users\\<你>\\Desktop\\AR项目\\PBF Pro - 全面预算系统流程导航.xlsb"
+```powershell
+# Windows
+setx PBF_NAV_FILE "D:\代码\PBF自动工具\pbf-uploader\PBF Pro - 全面预算系统流程导航.xlsb"
 ```
+
+```bash
+# macOS
+export PBF_NAV_FILE="/Users/<你>/Dev/PBF自动工具/pbf-uploader/PBF Pro - 全面预算系统流程导航.xlsb"
+```
+
+`config/flow.yaml` 里对应的是 `launch_file: "${PBF_NAV_FILE}"`；也可以直接把该行改成绝对路径或相对项目根目录的路径。变量没设置时，`run-flow` 会在预校验阶段直接报「环境变量未设置」并中止。
 
 路径不对时脚本无法自动启动 Excel。
 

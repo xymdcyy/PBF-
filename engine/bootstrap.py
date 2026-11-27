@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .cancel import raise_if_cancelled
 from .excel import ExcelEngine, ExcelError, reset_active_excel
-from paths import app_root
+from paths import app_root, resolve_path
 
 log = logging.getLogger(__name__)
 
@@ -462,7 +462,7 @@ def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False,
     raise_if_cancelled()
     nav = flow_cfg.get("navigator") or {}
     pattern = nav.get("workbook_pattern", "PBF Pro - 全面预算系统流程导航*")
-    path = Path(nav["launch_file"]) if nav.get("launch_file") else None
+    path = resolve_path(nav["launch_file"]) if nav.get("launch_file") else None
 
     # 0) 会话失效：强制结束本流程的 Excel。只认 stale_pid，绝不无差别杀进程。
     if force_restart:
