@@ -50,7 +50,11 @@ navigator:
   bw_nav_title: "PBF Pro - 全面预算系统流程导航"
   workbook_pattern: "PBF Pro - 全面预算系统流程导航*"
   sheet: "PBF Pro - 全面预算系统流程导航"
-  launch_file: "D:\\代码\\PBF自动工具\\pbf-uploader\\PBF Pro - 全面预算系统流程导航.xlsb"
+  # 导航表路径跟机器绑定，用环境变量指定（Windows / mac 各设各的，不进仓库）：
+  #   Windows: set PBF_NAV_FILE=D:\代码\PBF自动工具\pbf-uploader\PBF Pro - 全面预算系统流程导航.xlsb
+  #   macOS:   export PBF_NAV_FILE="/Users/<你>/Dev/PBF自动工具/pbf-uploader/PBF Pro - 全面预算系统流程导航.xlsb"
+  # 也支持直接写绝对路径或相对项目根目录的路径。
+  launch_file: "${PBF_NAV_FILE}"
   version_cell: "AR45"                 # 版本显示，如"滚动预测2026年11月月初版"
   refresh_flow_macro: "Refresh_Status"  # "刷新流程"按钮 Button 9
   open_button_cell: "AT52"             # 选中业务单元行后，AT52 变为"打开"

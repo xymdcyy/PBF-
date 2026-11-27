@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from paths import has_unresolved_var, resolve_path
+
 PERIOD_RE = re.compile(r"^\d{4}\.\d{2}$")
 COL_RE = re.compile(r"^[A-Z]{1,3}$")
 LAYOUTS = {"simple", "keyed", "matrix", "measure_blocks"}
@@ -297,8 +299,12 @@ def check_flow(flow_cfg: dict, form_cfgs: dict[str, dict], data_dir: Path,
         launch = nav.get("launch_file")
         if not launch:
             issues.append(_err("flow.yaml navigator.source=file 但未配置 launch_file"))
-        elif not Path(str(launch)).exists():
-            issues.append(_err(f"导航表不存在：{launch}（source=file）"))
+        elif has_unresolved_var(launch):
+            issues.append(_err(
+                f"导航表路径里的环境变量未设置：{launch}（source=file）；"
+                "设好环境变量（如 PBF_NAV_FILE）后重试"))
+        elif not resolve_path(launch).exists():
+            issues.append(_err(f"导航表不存在：{resolve_path(launch)}（source=file）"))
     elif source == "bw":
         if not nav.get("bw_connection"):
             issues.append(_warn("flow.yaml navigator.source=bw 但未配置 bw_connection，使用默认连接"))

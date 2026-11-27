@@ -19,7 +19,8 @@ import _stubs  # noqa: F401
 import engine.excel as ex
 from engine.excel import ExcelEngine, ExcelError
 
-NAV = r"D:\代码\PBF自动工具\pbf-uploader\PBF Pro - 全面预算系统流程导航.xlsb"
+# 只用于路径比较，文件不必真实存在；按项目根拼，跨平台不写死盘符
+NAV = str(Path(__file__).resolve().parent.parent / "PBF Pro - 全面预算系统流程导航.xlsb")
 
 
 class RotPathTest(unittest.TestCase):
@@ -30,8 +31,8 @@ class RotPathTest(unittest.TestCase):
             self.assertTrue(ExcelEngine.is_workbook_open(NAV))
 
     def test_other_workbooks_do_not_match(self):
-        with mock.patch.object(ExcelEngine, "_rot_display_names",
-                               return_value=[r"D:\代码\PBF自动工具\pbf-uploader\其他表.xlsb"]):
+        other = str(Path(NAV).with_name("其他表.xlsb"))
+        with mock.patch.object(ExcelEngine, "_rot_display_names", return_value=[other]):
             self.assertFalse(ExcelEngine.is_workbook_open(NAV))
 
     def test_non_file_monikers_are_ignored(self):

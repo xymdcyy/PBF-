@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -23,14 +24,16 @@ ROOT = app_root()
 
 
 def _default_template() -> Path:
+    # 模板位置跟机器绑定：优先环境变量，其次项目根，最后桌面上的历史位置
     candidates = [
+        Path(os.environ["PBF_TEMPLATE"]) if os.environ.get("PBF_TEMPLATE") else None,
         ROOT / "滚动预测模板表.xlsx",
-        Path("C:/Users/jiang5.zhou/Desktop/AR项目/滚动预测模板表.xlsx"),
+        Path.home() / "Desktop" / "AR项目" / "滚动预测模板表.xlsx",
     ]
     for c in candidates:
-        if c.exists():
+        if c and c.exists():
             return c
-    return candidates[0]
+    return ROOT / "滚动预测模板表.xlsx"
 
 
 def _default_out_dir(periods: list[str]) -> Path:
